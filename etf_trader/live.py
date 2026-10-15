@@ -8,6 +8,11 @@ Live runner — one shot, run by a CronJob ~20 minutes before the close.
      function the backtest grades.
   4. Diff against current positions and submit market-on-close orders.
 
+A rotation sells SPY and buys SSO (or back) in the same closing auction, so
+the buy is submitted before the sell's proceeds exist. That needs a margin
+account (Alpaca paper accounts are margin by default); the bot refuses to
+run on a cash account.
+
 The strategy is a pure function of price history, so there's no state file:
 a missed day is reconciled on the next run (anything held with a zero
 target is sold, anything targeted but not held is bought).
@@ -37,6 +42,9 @@ DATA_URL = "https://data.alpaca.markets"
 
 # Alpaca rejects market-on-close orders after 15:50 ET (10 min before close)
 MOC_CUTOFF_MINUTES = 10
+# Size off slightly less than full equity: the close can differ from the
+# price we size at ~30 min earlier
+CASH_BUFFER = 0.01
 
 log = logging.getLogger("etf_trader")
 
@@ -120,7 +128,6 @@ class Alpaca:
 def plan_orders(
     w_today: dict[str, float],
     w_yesterday: dict[str, float],
-    month_end: bool,
     positions: dict[str, int],
     equity: float,
     prices: dict[str, float],
@@ -129,18 +136,18 @@ def plan_orders(
     Return [(symbol, side, qty)], sells first.
 
     Mirrors backtest.run(): a symbol is re-sized only when its target weight
-    changed, or on month-end. On top of that, positions that disagree with
-    the target in kind (held but targeted at 0, or targeted but not held)
-    are always fixed — that's how a missed run self-heals.
+    changed. On top of that, positions that disagree with the target in kind
+    (held but targeted at 0, or targeted but not held) are always fixed —
+    that's how a missed run self-heals.
     """
     orders = []
     for sym in strategy.universe():
         target_w = w_today.get(sym, 0.0)
         held = positions.get(sym, 0)
-        target_qty = math.floor(target_w * equity / prices[sym]) if target_w > 0 else 0
+        budget = target_w * equity * (1 - CASH_BUFFER)
+        target_qty = math.floor(budget / prices[sym]) if target_w > 0 else 0
         should_trade = (
-            month_end
-            or target_w != w_yesterday.get(sym, 0.0)
+            target_w != w_yesterday.get(sym, 0.0)
             or (target_w == 0 and held != 0)
             or (target_w > 0 and held == 0)
         )
@@ -148,14 +155,6 @@ def plan_orders(
         if should_trade and delta:
             orders.append((sym, "buy" if delta > 0 else "sell", abs(delta)))
     return sorted(orders, key=lambda o: o[1] != "sell")
-
-
-def is_month_end(calendar: list[dict], today: date) -> bool:
-    upcoming = [date.fromisoformat(d["date"]) for d in calendar]
-    later = [d for d in upcoming if d > today]
-    if not later:
-        raise RuntimeError("calendar has no trading day after today")
-    return later[0].month != today.month
 
 
 def run(cfg: Config, now: datetime | None = None) -> dict:
@@ -168,8 +167,7 @@ def run(cfg: Config, now: datetime | None = None) -> dict:
     if not clock["is_open"]:
         return {**record, "action": "skip", "reason": "market closed"}
 
-    calendar = api.get("/v2/calendar", start=today.isoformat(),
-                       end=(today + timedelta(days=10)).isoformat())
+    calendar = api.get("/v2/calendar", start=today.isoformat(), end=today.isoformat())
     today_cal = next(d for d in calendar if d["date"] == today.isoformat())
     close_at = datetime.combine(today, datetime.strptime(today_cal["close"], "%H:%M").time(), ET)
     minutes_left = (close_at - now).total_seconds() / 60
@@ -177,21 +175,23 @@ def run(cfg: Config, now: datetime | None = None) -> dict:
         return {**record, "action": "skip", "reason": f"{minutes_left:.0f} min to close, outside window"}
 
     symbols = strategy.universe()
-    # ~400 trading days covers the 252-day momentum lookback plus 10 month-ends
-    closes = api.daily_closes(symbols, today - timedelta(days=600), today - timedelta(days=1))
-    closes = closes[closes.index.date < today]
+    core = strategy.CORE_SYMBOL
+    # ~400 trading days: SMA(200) warm-up plus plenty of room for the dip
+    # rule's state to settle
+    closes = api.daily_closes([core], today - timedelta(days=600), today - timedelta(days=1))
+    spy = closes.loc[closes.index.date < today, core].dropna()
+    if len(spy) < strategy.REGIME_SMA_DAYS + 50:
+        raise RuntimeError(f"only {len(spy)} days of {core} history")
     prices = api.latest_prices(symbols)
-    closes.loc[pd.Timestamp(today)] = pd.Series(prices)
-    missing = closes[symbols].iloc[-strategy.MOMENTUM_DAYS - 1:].isna().any()
-    if missing.any():
-        raise RuntimeError(f"missing price history for {list(missing[missing].index)}")
+    spy.loc[pd.Timestamp(today)] = prices[core]
 
-    month_end = strategy.month_end_flags(closes.index, last_is_month_end=is_month_end(calendar, today))
-    weights = strategy.target_weights(closes, month_end)
+    weights = strategy.target_weights(spy)
     w_today = weights.iloc[-1].to_dict()
     w_yesterday = weights.iloc[-2].to_dict()
 
     account = api.get("/v2/account")
+    if int(account.get("multiplier", "1")) < 2:
+        raise RuntimeError("cash account: same-close rotations need a margin account")
     equity = float(account["equity"])
     positions = {p["symbol"]: int(float(p["qty"])) for p in api.get("/v2/positions")}
     foreign = sorted(set(positions) - set(symbols))
@@ -205,7 +205,7 @@ def run(cfg: Config, now: datetime | None = None) -> dict:
         for o in open_orders:
             api.cancel_order(o["id"])
 
-    orders = plan_orders(w_today, w_yesterday, bool(month_end.iloc[-1]), positions, equity, prices)
+    orders = plan_orders(w_today, w_yesterday, positions, equity, prices)
     submitted = []
     for sym, side, qty in orders:
         coid = f"etf-{today:%Y%m%d}-{sym}-{side}-{uuid.uuid4().hex[:8]}"
@@ -217,8 +217,8 @@ def run(cfg: Config, now: datetime | None = None) -> dict:
         **record,
         "action": "trade" if submitted else "hold",
         "equity": equity,
-        "month_end": bool(month_end.iloc[-1]),
-        "trend_holding": strategy.trend_holding(closes, month_end).iloc[-1],
+        "spy_rsi2": round(float(strategy.rsi(spy).iloc[-1]), 1),
+        "boosted": bool(w_today[strategy.BOOST_SYMBOL]),
         "targets": {k: v for k, v in w_today.items() if v},
         "positions": positions,
         "cancelled_open_orders": len(open_orders),

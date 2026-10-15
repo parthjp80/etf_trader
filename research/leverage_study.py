@@ -9,7 +9,7 @@ the winner isn't hand-picked from a large search:
              when SPY close > SMA(200), else T-bills (SHY).
   LRS-3x     same with 3x.
   CORE+MR    100% SPY always; switch to 2x S&P while the RSI(2) mean-reversion
-             rule (strategy.mean_reversion_position) is long.
+             rule (strategy.dip_position) is long.
   2x B&H     2x S&P held always — shows what leverage alone does.
 
 Leveraged ETFs (SSO 2006, UPRO 2009) are too young for 1993+ history, so
@@ -72,7 +72,7 @@ def main():
               f"simulated {(s.iloc[-1]/s.iloc[0])**(1/yrs)-1:+.2%}  since {r.index[0]:%Y-%m}")
 
     above = px["SPY"] > px["SPY"].rolling(200).mean()
-    mr = strategy.mean_reversion_position(px["SPY"])
+    mr = strategy.dip_position(px["SPY"])
 
     def w(**cols):
         out = pd.DataFrame(0.0, index=px.index, columns=px.columns)
@@ -87,7 +87,6 @@ def main():
         "LRS-3x": w(X3=above, CASH=~above),
         "CORE+MR": w(SPY=~mr, X2=mr),
     }
-    me = pd.Series(False, index=px.index)
     start = px.index[200]
     results = {}
     for name, wt in cands.items():
@@ -95,7 +94,7 @@ def main():
             wt_d = wt.shift(delay).fillna(0) if delay else wt
             if name.endswith("B&H") and delay:
                 continue
-            res = backtest.run(px.loc[start:], px.loc[start:], wt_d.loc[start:], me.loc[start:], cost_bps=COST_BPS)
+            res = backtest.run(px.loc[start:], px.loc[start:], wt_d.loc[start:], cost_bps=COST_BPS)
             label = name + (" [+1d delay]" if delay else "")
             results[label] = res
 
@@ -111,7 +110,7 @@ def main():
             m["Trades/yr"] = len(res.trades[res.trades.date >= pd.Timestamp(a)]) / ((e.index[-1]-e.index[0]).days/365.25)
             m["$10k→"] = 10_000 * e.iloc[-1] / e.iloc[0]
             rows[k] = m
-        df = pd.DataFrame(rows).T.drop(columns="Final")
+        df = pd.DataFrame(rows).T
         print(f"\n── {p} ──")
         fmt = {"CAGR": "{:+.1%}", "Vol": "{:.1%}", "Sharpe": "{:.2f}", "MaxDD": "{:+.1%}",
                "Calmar": "{:.2f}", "Worst yr": "{:+.1%}", "Trades/yr": "{:.1f}", "$10k→": "${:,.0f}"}

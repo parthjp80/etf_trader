@@ -1,12 +1,14 @@
 """
-Grade the strategy on history.
+Grade SPY + dip-buy boost against SPY buy-and-hold.
 
     python run_backtest.py            # uses cached data/ if present
     python run_backtest.py --refresh  # re-download from Yahoo
 
-Reports the combined portfolio, each sleeve alone, and SPY buy-and-hold,
-over the full period and split at 2009 — the rules were published in
-2007–2008, so 2009 onward is out-of-sample for them.
+Two histories:
+  * Real SSO, 2006-06 onward. Fills at the close and at the next open.
+  * Synthetic SSO, 1994 onward (see history.synthetic_2x). Close fills only.
+
+The dip rule was published in 2008, so 2009 onward is out-of-sample.
 """
 
 import argparse
@@ -15,8 +17,8 @@ import pandas as pd
 
 from etf_trader import backtest, history, strategy
 
-OOS_START = "2009-01-01"
 COST_BPS = 5.0
+CORE, BOOST = strategy.CORE_SYMBOL, strategy.BOOST_SYMBOL
 
 
 def main():
@@ -26,99 +28,80 @@ def main():
     args = ap.parse_args()
 
     opens, closes = history.load(refresh=args.refresh)
-    symbols = strategy.universe()
-    opens, closes = opens[symbols], closes[symbols]
+    syms = strategy.universe()
 
-    # Start once every ETF trades; the trend sleeve then warms up on its own
-    start = closes.apply(lambda s: s.first_valid_index()).max()
-    opens, closes = opens.loc[start:], closes.loc[start:]
-    assert not closes.isna().any().any(), "gaps in close data"
+    # ── Synthetic SSO check ──
+    syn = history.synthetic_2x(closes[CORE], closes["^IRX"])
+    real = closes[BOOST].dropna()
+    yrs = (real.index[-1] - real.index[0]).days / 365.25
+    s = syn.loc[real.index[0]:]
+    print(f"SSO since {real.index[0]:%Y-%m}: real {(real.iloc[-1] / real.iloc[0]) ** (1 / yrs) - 1:+.2%}/yr, "
+          f"synthetic {(s.iloc[-1] / s.iloc[0]) ** (1 / yrs) - 1:+.2%}/yr")
+    print(f"Cost {args.cost_bps:g} bps per fill\n")
 
-    month_end = strategy.month_end_flags(closes.index, last_is_month_end=False)
-
-    variants = {
-        "Combined 50/50": (0.5, 0.5),
-        "Mean reversion only": (1.0, 0.0),
-        "Trend only": (0.0, 1.0),
+    # ── Real SSO, 2006+ ──
+    real_cl = closes.loc[real.index[0]:, syms]
+    real_op = opens.loc[real.index[0]:, syms]
+    w_real = strategy.target_weights(real_cl[CORE])
+    runs = {
+        "Boost [close]": backtest.run(real_op, real_cl, w_real, args.cost_bps, "close"),
+        "Boost [next open]": backtest.run(real_op, real_cl, w_real, args.cost_bps, "next_open"),
+        "SPY buy & hold": backtest.run(real_op, real_cl, w_real.assign(SPY=1.0, SSO=0.0), 0, "close"),
     }
-    curves = {}
-    for name, (mr, tr) in variants.items():
-        w = strategy.target_weights(closes, month_end, mr_weight=mr, trend_weight=tr)
-        for fill in ("close", "next_open"):
-            res = backtest.run(opens, closes, w, month_end, cost_bps=args.cost_bps, fill=fill)
-            curves[(name, fill)] = res
-    spy = closes["SPY"] / closes["SPY"].iloc[0] * 100_000
+    # Grade from when the 200-day SMA exists, so both sides start together
+    graded = real_cl.index[strategy.REGIME_SMA_DAYS]
+    report("Real SSO", runs, {"2007–now": (graded, None),
+                              "2009–now (out-of-sample)": ("2009-01-01", None),
+                              "2016–now": ("2016-01-01", None)})
 
-    # Grade everyone from the date the trend sleeve is live (~1 year warm-up)
-    live_from = curves[("Trend only", "close")].weights.sum(axis=1).ne(0).idxmax()
-    print(f"Data {closes.index[0]:%Y-%m-%d} → {closes.index[-1]:%Y-%m-%d}; "
-          f"graded from {live_from:%Y-%m-%d}; cost {args.cost_bps:g} bps/side\n")
-
-    periods = {
-        "Full": (live_from, None),
-        f"In-sample (<{OOS_START[:4]})": (live_from, pd.Timestamp(OOS_START) - pd.Timedelta(days=1)),
-        f"Out-of-sample ({OOS_START[:4]}+)": (pd.Timestamp(OOS_START), None),
+    # ── Synthetic SSO, 1994+ ──
+    syn_cl = pd.DataFrame({CORE: closes[CORE], BOOST: syn})
+    w_syn = strategy.target_weights(syn_cl[CORE])
+    syn_runs = {
+        "Boost [close]": backtest.run(syn_cl, syn_cl, w_syn, args.cost_bps, "close"),
+        "Boost [+1 day late]": backtest.run(syn_cl, syn_cl, w_syn.shift(1).fillna({CORE: 1.0, BOOST: 0.0}),
+                                            args.cost_bps, "close"),
+        "SPY buy & hold": backtest.run(syn_cl, syn_cl, w_syn.assign(SPY=1.0, SSO=0.0), 0, "close"),
     }
-    for label, (a, b) in periods.items():
-        rows = {}
-        for (name, fill), res in curves.items():
-            rows[f"{name} [{fill}]"] = backtest.metrics(res.equity.loc[a:b])
-        rows["SPY buy & hold"] = backtest.metrics(spy.loc[a:b])
-        df = pd.DataFrame(rows).T
-        print(f"── {label} ──")
-        print(_fmt(df.drop(columns="Final")))
-        print()
+    start = syn_cl.index[strategy.REGIME_SMA_DAYS]
+    report("Synthetic SSO", syn_runs, {"1994–now": (start, None),
+                                       "1994–2008 (in-sample)": (start, "2008-12-31")})
 
-    combined = curves[("Combined 50/50", "close")]
     yearly = pd.DataFrame({
-        "Combined": combined.equity.loc[live_from:].resample("YE").last().pct_change(),
-        "MR only": curves[("Mean reversion only", "close")].equity.loc[live_from:].resample("YE").last().pct_change(),
-        "Trend only": curves[("Trend only", "close")].equity.loc[live_from:].resample("YE").last().pct_change(),
-        "SPY": spy.loc[live_from:].resample("YE").last().pct_change(),
-    })
-    first = {c: s.loc[live_from:].resample("YE").last().iloc[0] / s.loc[live_from] - 1
-             for c, s in [("Combined", combined.equity),
-                          ("MR only", curves[("Mean reversion only", "close")].equity),
-                          ("Trend only", curves[("Trend only", "close")].equity),
-                          ("SPY", spy)]}
-    yearly.iloc[0] = pd.Series(first)
+        "Boost": syn_runs["Boost [close]"].equity.loc[start:].resample("YE").last().pct_change(),
+        "SPY": syn_runs["SPY buy & hold"].equity.loc[start:].resample("YE").last().pct_change(),
+    }).dropna()
+    yearly["Diff"] = yearly["Boost"] - yearly["SPY"]
     yearly.index = yearly.index.year
-    print("── Calendar-year returns (close fills) ──")
+    print("── Calendar years (synthetic SSO before mid-2006) ──")
     print(yearly.map(lambda x: f"{x:+.1%}").to_string())
-    print()
+    print(f"Boost beat SPY in {(yearly['Diff'] > 0).mean():.0%} of years; "
+          f"worst year vs SPY {yearly['Diff'].min():+.1%}, best {yearly['Diff'].max():+.1%}\n")
 
-    rt = backtest.mr_round_trips(closes.loc[live_from:], cost_bps=args.cost_bps)
-    print("── Mean-reversion round trips ──")
-    for label, sub in [("All", rt), ("<2009", rt[rt.entry < OOS_START]), ("2009+", rt[rt.entry >= OOS_START])]:
-        if sub.empty:
-            continue
-        wins = sub.ret > 0
-        pf = sub.ret[wins].sum() / -sub.ret[~wins].sum()
-        t_stat = sub.ret.mean() / sub.ret.std() * len(sub) ** 0.5
-        print(f"  {label:6s} n={len(sub):4d}  win={wins.mean():.0%}  avg={sub.ret.mean():+.2%} (t={t_stat:.1f})  "
-              f"avg win={sub.ret[wins].mean():+.2%}  avg loss={sub.ret[~wins].mean():+.2%}  "
-              f"worst={sub.ret.min():+.2%}  PF={pf:.2f}  avg hold={sub.days.mean():.1f}d")
-    mr_w = curves[("Mean reversion only", "close")].weights.loc[live_from:, list(strategy.MR_SYMBOLS)]
-    print(f"  MR sleeve holds at least one ETF {(mr_w > 0).any(axis=1).mean():.0%} of days, "
-          f"average capital deployed {mr_w.sum(axis=1).mean():.0%}")
-
-    tr = combined.trades
-    tr = tr[tr.date >= live_from]
-    print(f"\nCombined: {len(tr)} fills over {(closes.index[-1] - live_from).days / 365.25:.1f} years "
-          f"(~{len(tr) / ((closes.index[-1] - live_from).days / 365.25):.0f}/yr)")
-
-    holding = strategy.trend_holding(closes, month_end).loc[live_from:]
-    print("Trend sleeve time in each asset: " +
-          ", ".join(f"{k} {v:.0%}" for k, v in holding.value_counts(normalize=True).items()))
+    bt = backtest.boost_trades(syn_cl.loc[start:], args.cost_bps)
+    print("── Boost windows (edge = SSO return − SPY return − costs) ──")
+    for label, sub in [("1994–2008", bt[bt.entry < "2009-01-01"]), ("2009–now", bt[bt.entry >= "2009-01-01"])]:
+        wins = sub.edge > 0
+        t = sub.edge.mean() / sub.edge.std() * len(sub) ** 0.5
+        print(f"  {label}: n={len(sub)}  win={wins.mean():.0%}  avg edge={sub.edge.mean():+.2%} (t={t:.1f})  "
+              f"worst={sub.edge.min():+.2%}  avg hold={sub.days.mean():.1f}d")
+    on = w_syn.loc[start:, BOOST].mean()
+    print(f"  Boosted {on:.0%} of days; ~{len(bt) / ((syn_cl.index[-1] - start).days / 365.25):.0f} windows/yr "
+          f"(4 fills each)")
 
 
-def _fmt(df: pd.DataFrame) -> str:
-    out = df.copy()
-    for c in ("CAGR", "Vol", "MaxDD"):
-        out[c] = out[c].map(lambda x: f"{x:+.1%}" if c != "Vol" else f"{x:.1%}")
-    for c in ("Sharpe", "Calmar"):
-        out[c] = out[c].map(lambda x: f"{x:.2f}")
-    return out.to_string()
+def report(title, runs, periods):
+    for label, (start, end) in periods.items():
+        rows = {name: backtest.metrics(res.equity.loc[start:end]) for name, res in runs.items()}
+        df = pd.DataFrame(rows).T
+        for c in ("CAGR", "MaxDD", "Worst yr"):
+            df[c] = df[c].map(lambda x: f"{x:+.1%}")
+        df["Vol"] = df["Vol"].map(lambda x: f"{x:.1%}")
+        for c in ("Sharpe", "Calmar"):
+            df[c] = df[c].map(lambda x: f"{x:.2f}")
+        print(f"── {title}: {label} ──")
+        print(df.to_string())
+        print()
 
 
 if __name__ == "__main__":

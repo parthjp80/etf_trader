@@ -2,17 +2,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from etf_trader import backtest, live, strategy
+from etf_trader import backtest, history, live, strategy
 
 
-def make_closes(n=700, seed=0):
+def make_spy(n=700, seed=0):
     rng = np.random.default_rng(seed)
     idx = pd.bdate_range("2020-01-01", periods=n)
-    data = {
-        sym: 100 * np.exp(np.cumsum(rng.normal(0.0003 * (i + 1), 0.012, n)))
-        for i, sym in enumerate(strategy.universe())
-    }
-    return pd.DataFrame(data, index=idx)
+    return pd.Series(100 * np.exp(np.cumsum(rng.normal(0.0004, 0.012, n))), index=idx)
 
 
 def test_rsi_bounds_and_extremes():
@@ -20,98 +16,160 @@ def test_rsi_bounds_and_extremes():
     down = up[::-1].reset_index(drop=True)
     assert strategy.rsi(up).iloc[-1] == pytest.approx(100)
     assert strategy.rsi(down).iloc[-1] == pytest.approx(0)
-    r = strategy.rsi(make_closes()["SPY"]).dropna()
-    assert r.between(0, 100).all()
+    assert strategy.rsi(make_spy()).dropna().between(0, 100).all()
 
 
-def test_mean_reversion_enters_on_dip_and_exits_above_sma5():
-    # Long steady uptrend, then a two-day dip, then recovery
-    base = list(np.linspace(100, 160, 220))
-    prices = base + [155, 150, 151, 158, 162]
+def test_dip_enters_on_dip_and_exits_above_sma5():
+    # Long steady uptrend, a two-day dip, then a recovery
+    prices = list(np.linspace(100, 160, 220)) + [155, 150, 151, 158, 162]
     close = pd.Series(prices, index=pd.bdate_range("2021-01-01", periods=len(prices)))
-    pos = strategy.mean_reversion_position(close)
+    pos = strategy.dip_position(close)
     assert not pos.iloc[219]
     assert pos.iloc[221]           # RSI(2) collapses on the dip, still above SMA200
     assert not pos.iloc[-1]        # recovered above SMA5 → flat
 
 
-def test_month_end_flags():
-    idx = pd.bdate_range("2024-01-25", "2024-03-05")
-    flags = strategy.month_end_flags(idx, last_is_month_end=False)
-    assert list(idx[flags]) == [pd.Timestamp("2024-01-31"), pd.Timestamp("2024-02-29")]
-    assert strategy.month_end_flags(idx, last_is_month_end=True).iloc[-1]
+def test_no_dip_buys_below_sma200():
+    prices = list(np.linspace(160, 100, 220)) + [95, 90, 88]
+    close = pd.Series(prices, index=pd.bdate_range("2021-01-01", periods=len(prices)))
+    assert not strategy.dip_position(close).any()
 
 
-def test_weights_are_long_only_and_never_levered():
-    closes = make_closes()
-    me = strategy.month_end_flags(closes.index, False)
-    w = strategy.target_weights(closes, me)
-    assert (w >= 0).all().all()
-    assert (w.sum(axis=1) <= 1 + 1e-12).all()
-    # Trend sleeve fully invested after warm-up
-    assert w.iloc[-1].sum() >= strategy.TREND_WEIGHT
+def test_weights_always_fully_invested_in_exactly_one():
+    w = strategy.target_weights(make_spy())
+    assert (w.sum(axis=1) == 1.0).all()
+    assert w.isin([0.0, 1.0]).all().all()
+    assert w["SSO"].any() and w["SPY"].any()
 
 
 def test_no_lookahead():
     """Changing future prices must not change any past weight."""
-    closes = make_closes()
-    me = strategy.month_end_flags(closes.index, False)
-    w = strategy.target_weights(closes, me)
-
+    spy = make_spy()
     cut = 500
-    shocked = closes.copy()
-    shocked.iloc[cut:] *= np.linspace(0.5, 2.0, len(closes) - cut)[:, None]
-    w2 = strategy.target_weights(shocked, me)
-    pd.testing.assert_frame_equal(w.iloc[:cut], w2.iloc[:cut])
+    shocked = spy.copy()
+    shocked.iloc[cut:] *= np.linspace(0.5, 2.0, len(spy) - cut)
+    pd.testing.assert_frame_equal(strategy.target_weights(spy).iloc[:cut],
+                                  strategy.target_weights(shocked).iloc[:cut])
 
 
-def test_backtest_flat_weights_keep_cash():
-    closes = make_closes(300)
-    me = strategy.month_end_flags(closes.index, False)
-    w = pd.DataFrame(0.0, index=closes.index, columns=strategy.universe())
-    res = backtest.run(closes, closes, w, me)
-    assert res.equity.eq(100_000).all()
-    assert res.trades.empty
+def _closes(n=300):
+    spy = make_spy(n)
+    return pd.DataFrame({"SPY": spy, "SSO": (1 + 2 * spy.pct_change().fillna(0)).cumprod() * 100})
 
 
 def test_backtest_buy_and_hold_matches_price_less_costs():
-    closes = make_closes(300)
-    me = pd.Series(False, index=closes.index)
-    w = pd.DataFrame(0.0, index=closes.index, columns=strategy.universe())
-    w["SPY"] = 1.0
-    res = backtest.run(closes, closes, w, me, cost_bps=10)
+    closes = _closes()
+    w = pd.DataFrame({"SPY": 1.0, "SSO": 0.0}, index=closes.index)
+    res = backtest.run(closes, closes, w, cost_bps=10)
     expected = closes["SPY"].iloc[-1] / closes["SPY"].iloc[0] * 100_000 * (1 - 0.001)
     assert res.equity.iloc[-1] == pytest.approx(expected, rel=1e-3)
     assert len(res.trades) == 1
 
 
-def test_plan_orders_sells_first_and_heals_missed_runs():
-    prices = {s: 100.0 for s in strategy.universe()}
-    w = {"SPY": 0.25, "GLD": 0.5}
-    orders = live.plan_orders(
-        w_today=w, w_yesterday=w, month_end=False,
-        positions={"TLT": 500, "SPY": 250}, equity=100_000, prices=prices,
-    )
-    # TLT held but untargeted → sold; GLD targeted but missing → bought;
-    # SPY unchanged target and already held → left alone
-    assert orders == [("TLT", "sell", 500), ("GLD", "buy", 500)]
+def test_backtest_rotation_trades_both_legs_only_on_change():
+    closes = _closes()
+    w = pd.DataFrame({"SPY": 1.0, "SSO": 0.0}, index=closes.index)
+    w.iloc[100:105] = [0.0, 1.0]
+    res = backtest.run(closes, closes, w, cost_bps=0)
+    # initial buy, rotate in (2 fills), rotate out (2 fills)
+    assert len(res.trades) == 5
+    assert set(res.trades.date) == {closes.index[0], closes.index[100], closes.index[105]}
 
 
-def test_plan_orders_resizes_only_on_change_or_month_end():
-    prices = {s: 100.0 for s in strategy.universe()}
-    w = {"GLD": 0.5}
-    drifted = {"GLD": 450}
-    assert live.plan_orders(w, w, False, drifted, 100_000, prices) == []
-    assert live.plan_orders(w, w, True, drifted, 100_000, prices) == [("GLD", "buy", 50)]
+def test_synthetic_2x_doubles_daily_returns_before_costs():
+    spy = make_spy(50)
+    syn = history.synthetic_2x(spy, pd.Series(0.0, index=spy.index))
+    daily_cost = (history.FINANCING_SPREAD + history.SSO_EXPENSE_RATIO) / 252
+    np.testing.assert_allclose(syn.pct_change().iloc[1:], 2 * spy.pct_change().iloc[1:] - daily_cost)
 
 
-def test_is_month_end():
-    cal = [{"date": "2026-10-29"}, {"date": "2026-10-30"}, {"date": "2026-11-02"}]
-    assert live.is_month_end(cal, pd.Timestamp("2026-10-30").date())
-    assert not live.is_month_end(cal, pd.Timestamp("2026-10-29").date())
+PRICES = {"SPY": 500.0, "SSO": 100.0}
+
+
+def test_plan_rotation_sells_first():
+    orders = live.plan_orders({"SPY": 0.0, "SSO": 1.0}, {"SPY": 1.0, "SSO": 0.0},
+                              {"SPY": 198}, 100_000, PRICES)
+    assert orders == [("SPY", "sell", 198), ("SSO", "buy", 990)]
+
+
+def test_plan_holds_steady_and_heals_missed_runs():
+    w = {"SPY": 1.0, "SSO": 0.0}
+    # Unchanged target, already held (drifted) → no trade
+    assert live.plan_orders(w, w, {"SPY": 180}, 100_000, PRICES) == []
+    # Missed the exit: still holding SSO though target is SPY → fix both
+    assert live.plan_orders(w, w, {"SSO": 990}, 100_000, PRICES) == [
+        ("SSO", "sell", 990), ("SPY", "buy", 198)]
 
 
 def test_refuses_live_endpoint_without_flag():
     env = {"APCA_KEY_ID": "k", "APCA_SECRET_KEY": "s", "APCA_BASE_URL": "https://api.alpaca.markets"}
     with pytest.raises(SystemExit):
         live.Config(env)
+
+
+class FakeAlpaca:
+    """Stands in for the Alpaca REST API in an end-to-end run()."""
+
+    def __init__(self, spy, positions, multiplier="2", open_orders=()):
+        self.spy, self.positions, self.multiplier = spy, positions, multiplier
+        self.open_orders, self.submitted, self.cancelled = list(open_orders), [], []
+
+    def __call__(self, cfg):
+        return self
+
+    def get(self, path, **params):
+        return {
+            "/v2/clock": {"is_open": True},
+            "/v2/calendar": [{"date": params.get("start"), "close": "16:00"}],
+            "/v2/account": {"equity": "100000", "multiplier": self.multiplier},
+            "/v2/positions": [{"symbol": s, "qty": str(q)} for s, q in self.positions.items()],
+            "/v2/orders": self.open_orders,
+        }[path]
+
+    def daily_closes(self, symbols, start, end):
+        return self.spy.loc[:pd.Timestamp(end)].to_frame("SPY")
+
+    def latest_prices(self, symbols):
+        return {"SPY": float(self.spy.iloc[-1]), "SSO": 100.0}
+
+    def cancel_order(self, order_id):
+        self.cancelled.append(order_id)
+
+    def submit(self, symbol, qty, side, client_order_id):
+        self.submitted.append((symbol, side, qty))
+
+
+def _run(monkeypatch, fake, minutes_before_close=25, dry_run=False):
+    monkeypatch.setattr(live, "Alpaca", fake)
+    env = {"APCA_KEY_ID": "k", "APCA_SECRET_KEY": "s", "DRY_RUN": str(dry_run).lower()}
+    today = fake.spy.index[-1]
+    now = (today + pd.Timedelta(hours=16) - pd.Timedelta(minutes=minutes_before_close)).tz_localize(live.ET)
+    return live.run(live.Config(env), now=now.to_pydatetime())
+
+
+def test_run_end_to_end_buys_spy_in_empty_account(monkeypatch):
+    spy = make_spy(500)
+    spy.iloc[-1] = spy.iloc[-2] * 1.01  # up day → no dip signal today
+    fake = FakeAlpaca(spy, positions={}, open_orders=[{"id": "old"}])
+    rec = _run(monkeypatch, fake)
+    assert rec["action"] == "trade" and not rec["boosted"]
+    qty = int(100_000 * 0.99 // spy.iloc[-1])
+    assert fake.submitted == [("SPY", "buy", qty)]
+    assert fake.cancelled == ["old"]
+
+
+def test_run_skips_outside_window_and_respects_dry_run(monkeypatch):
+    spy = make_spy(500)
+    assert _run(monkeypatch, FakeAlpaca(spy, {}), minutes_before_close=90)["action"] == "skip"
+    assert _run(monkeypatch, FakeAlpaca(spy, {}), minutes_before_close=5)["action"] == "skip"
+    fake = FakeAlpaca(spy, {})
+    rec = _run(monkeypatch, fake, dry_run=True)
+    assert rec["orders"] and not fake.submitted
+
+
+def test_run_refuses_foreign_positions_and_cash_accounts(monkeypatch):
+    spy = make_spy(500)
+    with pytest.raises(RuntimeError, match="outside the strategy"):
+        _run(monkeypatch, FakeAlpaca(spy, {"AAPL": 5}))
+    with pytest.raises(RuntimeError, match="margin"):
+        _run(monkeypatch, FakeAlpaca(spy, {}, multiplier="1"))
