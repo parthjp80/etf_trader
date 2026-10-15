@@ -112,6 +112,6 @@ COPY requirements-dev.txt requirements.txt ./
 RUN pip install -r requirements-dev.txt
 WORKDIR /app
 EOF
-docker run --rm -v "$PWD":/app etf-trader-dev pytest -q
+docker run --rm -v "$PWD":/app etf-trader-dev python -m pytest -q
 docker run --rm -v "$PWD":/app etf-trader-dev python run_backtest.py
 ```
