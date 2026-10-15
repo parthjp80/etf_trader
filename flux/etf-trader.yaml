@@ -1,0 +1,36 @@
+# Applied once, directly to the cluster (kubectl apply -f flux/), same as
+# lowfloat_trader and tradingbot. Not under ./k8s, so Flux doesn't manage
+# its own wiring. The deploy-key secret was created with:
+#   flux create secret git etf-trader-deploy-key -n flux-system \
+#     --url=ssh://git@github.com/parthjp80/etf_trader
+# and its public key added as a read-only deploy key on the repo.
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: etf-trader
+  namespace: flux-system
+spec:
+  interval: 1m0s
+  ref:
+    branch: main
+  secretRef:
+    name: etf-trader-deploy-key
+  timeout: 60s
+  url: ssh://git@github.com/parthjp80/etf_trader
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: etf-trader
+  namespace: flux-system
+spec:
+  decryption:
+    provider: sops
+    secretRef:
+      name: sops-age
+  interval: 1m0s
+  path: ./k8s
+  prune: true
+  sourceRef:
+    kind: GitRepository
+    name: etf-trader

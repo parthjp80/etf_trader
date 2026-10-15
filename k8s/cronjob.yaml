@@ -8,6 +8,11 @@ metadata:
   name: etf-trader
   namespace: trading
 spec:
+  # Suspended until real Alpaca keys are in k8s/secret.env (it ships with
+  # placeholders). Flip to false and push to start the daily schedule.
+  # Manual runs still work while suspended:
+  #   kubectl -n trading create job etf-manual --from=cronjob/etf-trader
+  suspend: true
   schedule: "30 12,15 * * 1-5"
   timeZone: "America/New_York"
   concurrencyPolicy: Forbid

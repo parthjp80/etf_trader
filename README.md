@@ -94,14 +94,47 @@ cancels its own open orders before resubmitting.
 
 ### Deploy (Flux, same pattern as lowfloat_trader)
 
-1. Create a new Alpaca paper account. Copy `k8s/secret.env.example` to
-   `k8s/secret.env` and add its keys. Then run `sops -e -i k8s/secret.env`.
-2. Push to GitHub. The workflow runs the tests and pushes
-   `ghcr.io/parthjp80/etf_trader:latest`.
-3. Add a `GitRepository` and `Kustomization` for `./k8s` in `flux-system`,
-   with a deploy key and sops decryption.
-4. For a first run that places no orders, set `DRY_RUN=true` and trigger it:
-   `kubectl -n trading create job etf-manual --from=cronjob/etf-trader`
+Already wired up:
+- `flux/etf-trader.yaml` defines the `GitRepository` and `Kustomization` in
+  `flux-system`. They're applied directly to the cluster and track `./k8s`
+  on `main`.
+- The repo has a read-only deploy key, stored as the `etf-trader-deploy-key`
+  secret in `flux-system`.
+- `k8s/secret.env` is sops-encrypted with the same age key as the cluster's
+  `sops-age` secret, so Flux decrypts it on reconcile.
+- The bot shares the `trading` namespace and uses an `nfs-csi` PVC
+  (`etf-trader-logs`).
+
+To go live on paper:
+
+1. **Make the image public.** Go to
+   github.com/users/parthjp80/packages/container/etf_trader/settings →
+   Change visibility. The image has no secrets in it.
+2. **Add keys** for a *dedicated* Alpaca paper account. Run
+   `sops k8s/secret.env` and replace the `REPLACE_ME` placeholders.
+3. **Dry run.** Push, then trigger a manual run inside the last 40 minutes
+   before the close:
+   ```bash
+   kubectl -n trading create job etf-manual --from=cronjob/etf-trader
+   kubectl -n trading logs -f job/etf-manual
+   ```
+   `DRY_RUN=true` in `k8s/configmap.env` logs the plan without placing
+   orders.
+4. **Turn it on.** Set `DRY_RUN=false` in `k8s/configmap.env` and
+   `suspend: false` in `k8s/cronjob.yaml`, then push.
+
+Everyday operations:
+
+```bash
+kubectl -n trading get cronjob etf-trader         # schedule / last run
+kubectl -n trading get jobs -l app.kubernetes.io/name=etf-trader
+kubectl -n trading logs job/<job-name>            # one JSON line per run
+flux reconcile kustomization etf-trader --with-source   # deploy now instead of waiting ~1m
+```
+
+Code changes deploy on `git push`. The workflow tests the code and pushes
+`:latest`, and the CronJob pulls with `imagePullPolicy: Always`, so the next
+run picks it up with no restart needed.
 
 ### Local development
 
