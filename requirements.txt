@@ -1,3 +1,8 @@
-numpy==2.5.4
-pandas==3.0.6
+# Pinned <2: NumPy 2.x manylinux wheels require the x86-64-v2 CPU baseline
+# (SSE4.2/POPCNT), which the k8s worker nodes don't expose, so 2.x crashes
+# on import there ("NumPy was built with baseline optimizations: (X86_V2)
+# but your machine doesn't support"). Same constraint as tradingbot.
+# pandas 2.2 is the last line built against NumPy 1.x.
+numpy==1.26.4
+pandas==2.2.3
 requests==2.32.5
