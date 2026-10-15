@@ -1,0 +1,26 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Shares the existing `trading` namespace with lowfloat-trader and
+# tradingbot; it doesn't create or own it.
+namespace: trading
+
+resources:
+  - pvc.yaml
+  - cronjob.yaml
+
+configMapGenerator:
+  - name: etf-trader-config
+    envs:
+      - configmap.env
+
+secretGenerator:
+  - name: etf-trader-secrets
+    envs:
+      - secret.env
+
+labels:
+  - pairs:
+      app.kubernetes.io/name: etf-trader
+      app.kubernetes.io/managed-by: kustomize
+    includeSelectors: false

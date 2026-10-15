@@ -1,0 +1,6 @@
+__pycache__/
+.pytest_cache/
+.venv/
+.env
+k8s/secret.env.plain
+logs/

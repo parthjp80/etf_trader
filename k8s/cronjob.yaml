@@ -1,0 +1,47 @@
+# Runs at 15:30 ET (normal days) and 12:30 ET (half days, 13:00 close).
+# The bot checks the Alpaca clock and calendar itself and only trades when
+# it's inside RUN_WINDOW_MINUTES of the close and before the 15:50 MOC
+# cutoff — so on any given day exactly one of the two runs acts.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: etf-trader
+  namespace: trading
+spec:
+  schedule: "30 12,15 * * 1-5"
+  timeZone: "America/New_York"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      # A retry is safe: each run cancels its own open MOC orders first
+      backoffLimit: 1
+      activeDeadlineSeconds: 480
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: etf-trader
+              image: ghcr.io/parthjp80/etf_trader:latest
+              imagePullPolicy: Always
+              envFrom:
+                - configMapRef:
+                    name: etf-trader-config
+                - secretRef:
+                    name: etf-trader-secrets
+              volumeMounts:
+                - name: logs
+                  mountPath: /app/logs
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+          volumes:
+            - name: logs
+              persistentVolumeClaim:
+                claimName: etf-trader-logs
