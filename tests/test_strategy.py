@@ -181,3 +181,49 @@ def test_run_refuses_foreign_positions_and_cash_accounts(monkeypatch):
         _run(monkeypatch, FakeAlpaca(spy, {"AAPL": 5}))
     with pytest.raises(RuntimeError, match="margin"):
         _run(monkeypatch, FakeAlpaca(spy, {}, multiplier="1"))
+
+
+from etf_trader import report  # noqa: E402
+
+
+class FakeReportApi:
+    def __init__(self, spy):
+        self.spy = spy
+
+    def get(self, path, **params):
+        return {
+            "/v2/account": {"equity": "102000", "last_equity": "101000", "cash": "800"},
+            "/v2/positions": [{"symbol": "SSO", "qty": "1000", "avg_entry_price": "100", "current_price": "101.2",
+                               "market_value": "101200", "unrealized_pl": "1200", "unrealized_plpc": "0.012"}],
+            "/v2/orders": [{"symbol": "SSO", "side": "buy", "qty": "500", "filled_qty": "200",
+                            "filled_avg_price": "101.2", "status": "expired"}],
+        }[path]
+
+    def daily_closes(self, symbols, start, end):
+        return self.spy.to_frame("SPY")
+
+
+def test_report_numbers_and_warnings():
+    spy = make_spy(500)
+    start, today = spy.index[-10], spy.index[-1]
+    runs = [{"ts": f"{start:%Y-%m-%d}T15:30:00-04:00", "action": "trade", "equity": 100000.0, "orders": []},
+            {"ts": f"{today:%Y-%m-%d}T15:30:00-04:00", "action": "hold", "orders": []}]
+    now = (today + pd.Timedelta(hours=16, minutes=20)).tz_localize(live.ET).to_pydatetime()
+    d = report.gather(FakeReportApi(spy), runs, now)
+    assert d["day_pnl"] == 1000
+    assert d["since"]["bot"] == pytest.approx(0.02)
+    assert d["since"]["spy"] == pytest.approx(spy.iloc[-1] / spy.loc[start] - 1)
+    assert d["signal"]["exit_level"] == pytest.approx(spy.iloc[-4:].mean())
+    assert any("200 of 500 filled" in w for w in d["warnings"])
+    subject, html = report.render(d)
+    assert "▲ $1,000.00" in subject and "⚠️" in subject
+    assert "$101,200.00" in html and "Needs a look" in html
+
+
+def test_report_flags_missing_run():
+    spy = make_spy(500)
+    now = (spy.index[-1] + pd.Timedelta(hours=16, minutes=20)).tz_localize(live.ET).to_pydatetime()
+    d = report.gather(FakeReportApi(spy), [], now)
+    assert d["since"] is None
+    assert any("No run reached the closing window" in w for w in d["warnings"])
+    report.render(d)

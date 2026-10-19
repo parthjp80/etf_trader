@@ -8,6 +8,7 @@ namespace: trading
 resources:
   - pvc.yaml
   - cronjob.yaml
+  - cronjob-report.yaml
 
 configMapGenerator:
   - name: etf-trader-config

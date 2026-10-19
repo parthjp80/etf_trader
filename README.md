@@ -123,6 +123,20 @@ To go live on paper:
 4. **Turn it on.** Set `DRY_RUN=false` in `k8s/configmap.env` and
    `suspend: false` in `k8s/cronjob.yaml`, then push.
 
+### End-of-day email
+
+`k8s/cronjob-report.yaml` runs `python -m etf_trader.report` at 16:20 ET on
+weekdays (holidays skip themselves). The email has the day's P&L, the return
+since the first trade against SPY over the same span, holdings, today's
+orders with fill status, and the signal: what would flip it at the next
+close. Partial fills, failed runs and a missing run get a warning banner and
+a ⚠️ in the subject. It uses the same Gmail credentials as lowfloat_trader
+(`EMAIL_FROM`, `EMAIL_TO`, `EMAIL_PASSWORD` in `k8s/secret.env`).
+
+```bash
+kubectl -n trading create job etf-report-now --from=cronjob/etf-trader-report
+```
+
 Everyday operations:
 
 ```bash

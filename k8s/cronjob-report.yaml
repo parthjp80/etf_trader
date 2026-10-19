@@ -1,0 +1,49 @@
+# End-of-day P&L email, 16:20 ET on weekdays — after the 16:00 close and
+# the ~16:02 expiry of any unfilled MOC remainder. It skips market holidays
+# itself (Alpaca calendar). Send one now:
+#   kubectl -n trading create job etf-report-now --from=cronjob/etf-trader-report
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: etf-trader-report
+  namespace: trading
+spec:
+  schedule: "20 16 * * 1-5"
+  timeZone: "America/New_York"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 1800
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # No retry: a failure after the SMTP send would mail it twice
+      backoffLimit: 0
+      activeDeadlineSeconds: 300
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: report
+              image: ghcr.io/parthjp80/etf_trader:latest
+              imagePullPolicy: Always
+              command: ["python", "-u", "-m", "etf_trader.report"]
+              envFrom:
+                - configMapRef:
+                    name: etf-trader-config
+                - secretRef:
+                    name: etf-trader-secrets
+              volumeMounts:
+                - name: logs
+                  mountPath: /app/logs
+                  readOnly: true
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+          volumes:
+            - name: logs
+              persistentVolumeClaim:
+                claimName: etf-trader-logs
