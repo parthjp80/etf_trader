@@ -101,6 +101,14 @@ def test_plan_holds_steady_and_heals_missed_runs():
         ("SSO", "sell", 990), ("SPY", "buy", 198)]
 
 
+def test_plan_tops_up_partial_fill():
+    w = {"SPY": 0.0, "SSO": 1.0}
+    # Only 608 of 990 SSO filled yesterday → buy the rest
+    assert live.plan_orders(w, w, {"SSO": 608}, 100_000, PRICES) == [("SSO", "buy", 382)]
+    # Within tolerance → leave it
+    assert live.plan_orders(w, w, {"SSO": 950}, 100_000, PRICES) == []
+
+
 def test_refuses_live_endpoint_without_flag():
     env = {"APCA_KEY_ID": "k", "APCA_SECRET_KEY": "s", "APCA_BASE_URL": "https://api.alpaca.markets"}
     with pytest.raises(SystemExit):

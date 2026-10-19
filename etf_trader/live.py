@@ -45,6 +45,11 @@ MOC_CUTOFF_MINUTES = 10
 # Size off slightly less than full equity: the close can differ from the
 # price we size at ~30 min earlier
 CASH_BUFFER = 0.01
+# Re-size a held position whose share count is this far off target. Holding
+# one ETF, drift only comes from the cash buffer and dividends, so 10% is
+# never hit by drift; a partial fill (Alpaca filled 608 of 1,113 SSO on
+# 2026-10-16) is.
+REBALANCE_TOLERANCE = 0.10
 
 log = logging.getLogger("etf_trader")
 
@@ -138,7 +143,9 @@ def plan_orders(
     Mirrors backtest.run(): a symbol is re-sized only when its target weight
     changed. On top of that, positions that disagree with the target in kind
     (held but targeted at 0, or targeted but not held) are always fixed —
-    that's how a missed run self-heals.
+    that's how a missed run self-heals. So is a position more than
+    REBALANCE_TOLERANCE off its target size, which catches a partially
+    filled MOC order without trading on everyday drift.
     """
     orders = []
     for sym in strategy.universe():
@@ -150,6 +157,7 @@ def plan_orders(
             target_w != w_yesterday.get(sym, 0.0)
             or (target_w == 0 and held != 0)
             or (target_w > 0 and held == 0)
+            or abs(target_qty - held) > REBALANCE_TOLERANCE * target_qty
         )
         delta = target_qty - held
         if should_trade and delta:
