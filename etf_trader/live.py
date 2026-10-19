@@ -1,17 +1,24 @@
 """
-Live runner — one shot, run by a CronJob ~20 minutes before the close.
+Live runner — one shot, run by a CronJob ~15 minutes before the close.
 
-  1. Bail unless the market is open and we're inside the MOC window.
+  1. Bail unless the market is open and we're inside the closing window.
   2. Build daily closes from Alpaca history, with today's latest trade
      standing in for today's close.
   3. Compute target weights with strategy.target_weights() — the same
      function the backtest grades.
-  4. Diff against current positions and submit market-on-close orders.
+  4. Diff against current positions and submit market orders, which fill
+     right away, ~15 minutes before the close.
 
-A rotation sells SPY and buys SSO (or back) in the same closing auction, so
-the buy is submitted before the sell's proceeds exist. That needs a margin
-account (Alpaca paper accounts are margin by default); the bot refuses to
-run on a cash account.
+Why not market-on-close: Alpaca paper partial-fills MOC orders at random
+and expires the rest at the close (608 of 1,113 on 2026-10-16, 0 of 497 on
+2026-10-19), and live accounts only get MOC with Alpaca's elite order
+routing. Filling 15 minutes early, at about the price the signal was
+computed from, costs little: the backtest's one-day-late variant loses
+~1.2%/yr, and 15 minutes is a small fraction of that.
+
+A rotation sells SPY and buys SSO (or back) back to back, so the buy goes in
+before the sell's proceeds settle. That needs a margin account (Alpaca paper
+accounts are margin by default); the bot refuses to run on a cash account.
 
 The strategy is a pure function of price history, so there's no state file:
 a missed day is reconciled on the next run (anything held with a zero
@@ -40,8 +47,8 @@ ET = ZoneInfo("America/New_York")
 PAPER_URL = "https://paper-api.alpaca.markets"
 DATA_URL = "https://data.alpaca.markets"
 
-# Alpaca rejects market-on-close orders after 15:50 ET (10 min before close)
-MOC_CUTOFF_MINUTES = 10
+# Leave market orders a few minutes to fill before the close
+CLOSE_BUFFER_MINUTES = 2
 # Size off slightly less than full equity: the close can differ from the
 # price we size at ~30 min earlier
 CASH_BUFFER = 0.01
@@ -61,7 +68,7 @@ class Config:
         self.base_url = env.get("APCA_BASE_URL", PAPER_URL).rstrip("/")
         self.allow_live = env.get("ALLOW_LIVE", "false").lower() == "true"
         self.dry_run = env.get("DRY_RUN", "false").lower() == "true"
-        self.window_minutes = int(env.get("RUN_WINDOW_MINUTES", "40"))
+        self.window_minutes = int(env.get("RUN_WINDOW_MINUTES", "20"))
         self.log_path = Path(env.get("LOG_PATH", "/app/logs"))
         if self.base_url != PAPER_URL and not self.allow_live:
             raise SystemExit(f"Refusing to trade against {self.base_url} without ALLOW_LIVE=true")
@@ -125,7 +132,7 @@ class Alpaca:
     def submit(self, symbol, qty, side, client_order_id):
         return self._req("POST", f"{self.cfg.base_url}/v2/orders", json={
             "symbol": symbol, "qty": str(qty), "side": side,
-            "type": "market", "time_in_force": "cls",
+            "type": "market", "time_in_force": "day",
             "client_order_id": client_order_id,
         })
 
@@ -145,7 +152,7 @@ def plan_orders(
     (held but targeted at 0, or targeted but not held) are always fixed —
     that's how a missed run self-heals. So is a position more than
     REBALANCE_TOLERANCE off its target size, which catches a partially
-    filled MOC order without trading on everyday drift.
+    filled order without trading on everyday drift.
     """
     orders = []
     for sym in strategy.universe():
@@ -179,7 +186,7 @@ def run(cfg: Config, now: datetime | None = None) -> dict:
     today_cal = next(d for d in calendar if d["date"] == today.isoformat())
     close_at = datetime.combine(today, datetime.strptime(today_cal["close"], "%H:%M").time(), ET)
     minutes_left = (close_at - now).total_seconds() / 60
-    if not (MOC_CUTOFF_MINUTES < minutes_left <= cfg.window_minutes):
+    if not (CLOSE_BUFFER_MINUTES < minutes_left <= cfg.window_minutes):
         return {**record, "action": "skip", "reason": f"{minutes_left:.0f} min to close, outside window"}
 
     symbols = strategy.universe()
@@ -207,7 +214,8 @@ def run(cfg: Config, now: datetime | None = None) -> dict:
         raise RuntimeError(f"account holds positions outside the strategy: {foreign} — "
                            "this bot needs a dedicated account")
 
-    # Idempotent re-runs: drop any MOC orders a previous attempt left today
+    # Idempotent re-runs: drop anything a previous attempt left unfilled.
+    # Positions above already include what did fill.
     open_orders = api.get("/v2/orders", status="open", symbols=",".join(symbols))
     if not cfg.dry_run:
         for o in open_orders:

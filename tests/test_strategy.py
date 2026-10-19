@@ -147,7 +147,7 @@ class FakeAlpaca:
         self.submitted.append((symbol, side, qty))
 
 
-def _run(monkeypatch, fake, minutes_before_close=25, dry_run=False):
+def _run(monkeypatch, fake, minutes_before_close=15, dry_run=False):
     monkeypatch.setattr(live, "Alpaca", fake)
     env = {"APCA_KEY_ID": "k", "APCA_SECRET_KEY": "s", "DRY_RUN": str(dry_run).lower()}
     today = fake.spy.index[-1]
@@ -168,8 +168,8 @@ def test_run_end_to_end_buys_spy_in_empty_account(monkeypatch):
 
 def test_run_skips_outside_window_and_respects_dry_run(monkeypatch):
     spy = make_spy(500)
-    assert _run(monkeypatch, FakeAlpaca(spy, {}), minutes_before_close=90)["action"] == "skip"
-    assert _run(monkeypatch, FakeAlpaca(spy, {}), minutes_before_close=5)["action"] == "skip"
+    assert _run(monkeypatch, FakeAlpaca(spy, {}), minutes_before_close=30)["action"] == "skip"
+    assert _run(monkeypatch, FakeAlpaca(spy, {}), minutes_before_close=1)["action"] == "skip"
     fake = FakeAlpaca(spy, {})
     rec = _run(monkeypatch, fake, dry_run=True)
     assert rec["orders"] and not fake.submitted
@@ -227,3 +227,11 @@ def test_report_flags_missing_run():
     assert d["since"] is None
     assert any("No run reached the closing window" in w for w in d["warnings"])
     report.render(d)
+
+
+def test_submits_plain_market_day_orders(monkeypatch):
+    api = live.Alpaca(live.Config({"APCA_KEY_ID": "k", "APCA_SECRET_KEY": "s"}))
+    sent = {}
+    monkeypatch.setattr(api, "_req", lambda method, url, **kw: sent.update(kw["json"]))
+    api.submit("SSO", 497, "buy", "etf-x")
+    assert sent["type"] == "market" and sent["time_in_force"] == "day"

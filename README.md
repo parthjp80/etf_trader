@@ -68,26 +68,31 @@ any of them was run.
 
 ## Running it
 
-The bot runs as a k8s CronJob at 15:30 and 12:30 ET on weekdays. Each run:
+The bot runs as a k8s CronJob at 15:45 and 12:45 ET on weekdays. Each run:
 
 1. Checks the Alpaca clock and calendar. It only acts when it's within
-   `RUN_WINDOW_MINUTES` of the close and before the 15:50 MOC cutoff. That
+   `RUN_WINDOW_MINUTES` (20) of the close and at least 2 minutes before it. That
    handles half days.
 2. Builds SPY history from Alpaca adjusted daily bars. Today's latest IEX
    trade stands in for today's close.
-3. Submits whole-share **market-on-close** orders, sells first. It sizes off
-   99% of equity, leaving a 1% buffer for movement into the close.
+3. Submits whole-share **market** orders, sells first, which fill right
+   away. It sizes off 99% of equity, leaving a 1% buffer. It doesn't use
+   market-on-close orders: Alpaca paper fills them only partly at random
+   (608 of 1,113 and 0 of 497 in the first two runs), and live accounts
+   only get them with Alpaca's elite order routing. Filling 15 minutes
+   early costs little next to the backtest's one-day-late variant (−1.2%/yr).
 4. Appends one JSON line per run to `/app/logs/runs.jsonl`.
 
 There is no state file. Positions are reconciled against the target on every
-run, so a missed day self-heals the next day. A retry is also safe: each run
-cancels its own open orders before resubmitting.
+run, so a missed day self-heals the next day, and so does a partial fill
+more than 10% short of target. A retry is also safe: it cancels anything
+left unfilled and re-plans from the positions that actually filled.
 
 **Requirements:**
 - **A dedicated Alpaca account.** The bot refuses to trade if it sees
   positions other than SPY or SSO.
-- **A margin account.** The SPY sale and SSO purchase happen in the same
-  closing auction, so the buy is submitted before the sale's cash exists.
+- **A margin account.** The SPY sale and SSO purchase go in back to back,
+  so the buy is submitted before the sale's cash settles.
   Paper accounts are margin by default. The bot refuses to run on a cash
   account.
 - `APCA_BASE_URL` points at paper unless you set `ALLOW_LIVE=true`.

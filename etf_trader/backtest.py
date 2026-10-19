@@ -5,7 +5,7 @@ Execution model mirrors live.py:
   * Signals are computed from the close of day t.
   * A symbol is traded on day t only if its target weight changed from
     day t-1. Between changes, holdings drift with the market.
-  * fill="close"     — filled at day t's close (live uses market-on-close).
+  * fill="close"     — filled at day t's close (live fills ~15 min before it).
   * fill="next_open" — filled at day t+1's open. A pessimistic cross-check:
     if the edge only exists at the exact close, it isn't robust.
   * Every fill pays cost_bps of notional. Alpaca charges no commission, so

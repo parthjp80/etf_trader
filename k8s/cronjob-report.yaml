@@ -1,5 +1,5 @@
-# End-of-day P&L email, 16:20 ET on weekdays — after the 16:00 close and
-# the ~16:02 expiry of any unfilled MOC remainder. It skips market holidays
+# End-of-day P&L email, 16:20 ET on weekdays — after the 16:00 close, once
+# any unfilled remainder of the day's orders has expired. It skips market holidays
 # itself (Alpaca calendar). Send one now:
 #   kubectl -n trading create job etf-report-now --from=cronjob/etf-trader-report
 apiVersion: batch/v1
