@@ -1,10 +1,12 @@
-# ETF Trader — SPY + dip-buy boost
+# ETF Trader — 50/50 SPY + QQQ with dip-buy boosts
 
-The bot holds 100% SPY. When SPY has a sharp short-term dip inside an uptrend,
-it rotates into **SSO (2x S&P 500)** at the close. It rotates back to SPY at
-the close once the dip has bounced.
+The account is split into two equal sleeves: **SPY** and **QQQ**. Each
+sleeve has its own dip rule, computed on its own index. When a sharp
+short-term dip hits inside an uptrend, that sleeve rotates into its 2x ETF
+(**SSO** for SPY, **QLD** for QQQ). It rotates back once the dip has bounced.
+Either sleeve, both or neither can be boosted on a given day.
 
-| | Rule (computed on SPY's adjusted daily closes) |
+| | Rule (each sleeve, on its own index's adjusted daily closes) |
 |---|---|
 | Boost on | close > SMA(200) **and** RSI(2) < 10 |
 | Boost off | close > SMA(5) |
@@ -14,57 +16,77 @@ Work* (2008). The constants are the published ones and are not fitted to this
 data. **Don't tune them against the backtest.** That's how lowfloat_trader
 ended up fitting noise.
 
+Between signal changes the sleeves drift with the market. A position more
+than 10% off its target size is re-sized, so the mix is pulled back to
+50/50 once it drifts past about 55/45. The backtest and the live bot apply
+the same rule.
+
 All signal logic lives in `etf_trader/strategy.py`. The backtest and the live
 bot both call the same `target_weights()`.
+
+Until 2026-10-21 the bot ran a SPY-only version (100% SPY, boosted into SSO).
+`research/qqq_study.py` is where the 50/50 version was chosen, from six
+candidates that were all fixed before any of them was run.
 
 ## Backtest
 
 Run `python run_backtest.py`. Every fill pays 5 bps.
 
-**Real SSO** (2006-06 onward):
+**Real SSO/QLD, 2009–2026 (out-of-sample):**
 
-| Period | Boost CAGR | Sharpe | Max DD | SPY CAGR | Sharpe | Max DD |
-|---|---|---|---|---|---|---|
-| 2007–2026 | +12.8% | 0.65 | −55.6% | +11.0% | 0.63 | −55.2% |
-| **2009–2026 (out-of-sample)** | **+16.8%** | **0.85** | **−36.9%** | +14.7% | 0.86 | −33.7% |
-| 2016–2026 | +17.7% | 0.90 | −36.9% | +15.1% | 0.89 | −33.7% |
-
-**Synthetic SSO** (1994 onward). The synthetic series is 2x SPY's daily return
-minus financing and fees. Since 2006 it tracks real SSO within 0.15%/yr.
-
-| Period | Boost CAGR | Max DD | SPY CAGR | Max DD |
+| | CAGR | Sharpe | Max DD | Worst yr |
 |---|---|---|---|---|
-| 1994–2026 | +14.1% | −55.6% | +10.9% | −55.2% |
-| 1994–2026, trades one day late | +12.9% | −57.0% | | |
+| **50/50 boost** | **+19.7%** | **0.91** | **−33.6%** | −28.4% |
+| 50/50 boost, filled at next open | +19.2% | 0.90 | −33.8% | −28.2% |
+| 50/50 SPY/QQQ held | +17.6% | 0.95 | −30.7% | −25.4% |
+| SPY boost (previous bot) | +16.7% | 0.84 | −36.9% | −21.2% |
+| SPY held | +14.6% | 0.86 | −33.7% | −18.2% |
+
+**Synthetic SSO/QLD, 1999–2026.** The synthetic series is 2x the index's
+daily return minus financing and fees. Since 2006 it tracks real SSO and QLD
+within about 0.2%/yr. It covers the 2000–02 Nasdaq crash.
+
+| | CAGR | Max DD |
+|---|---|---|
+| **50/50 boost** | **+10.8%** | **−70.1%** |
+| 50/50 boost, trades one day late | +10.1% | −70.4% |
+| 50/50 SPY/QQQ held | +8.8% | −68.8% |
+| SPY boost (previous bot) | +10.2% | −55.6% |
+| SPY held | +8.3% | −55.2% |
 
 ### What these numbers mean
 
-- **It beat SPY by about 2–3%/yr in every period, with almost the same crash
-  risk.** It holds SPY through bear markets, so 2008 was −37% for both. It is
-  not downside protection.
-- **Since 2009, about half of the gain is just leverage.** The bot averages
-  1.11x exposure. Holding a constant 1.11x of SPY earned +15.9%/yr against
-  the boost's +17.1%. So the timing edge after publication is roughly
-  1.2–1.5%/yr, not 2.4%.
-- **The per-trade edge has weakened since the rule was published.**
+- **Most of the gain over SPY comes from holding QQQ, not from the boost.**
+  QQQ beat SPY by a wide margin after 2009 because tech led the market.
+  Choosing it now uses hindsight, and that lead isn't guaranteed to last.
+- **The boost adds about 2%/yr over the same mix held, with a slightly lower
+  Sharpe.** Like the SPY-only version, much of that is extra leverage: the
+  bot averages 1.11x exposure.
+- **The crash risk is higher than SPY's.** From 1999 to 2008 this lost
+  5.7%/yr, with a −70% drawdown, against −51% for SPY. A dot-com-style tech
+  crash would hurt this far more than the SPY-only bot.
+- **The rule works on QQQ as well as on SPY.** It was published on the S&P
+  and never fitted to QQQ, and its per-window edge since 2009 matches:
 
-  | Boost windows | Count | Avg edge vs SPY | t-stat |
+  | Boost windows, 2009–now | Count | Avg edge vs core | t-stat |
   |---|---|---|---|
-  | 1994–2008 | 110 | +0.56% | 4.1 |
-  | 2009–now | 149 | +0.29% | 2.2 |
+  | SPY → SSO | 150 | +0.29% | 2.1 |
+  | QQQ → QLD | 156 | +0.29% | 2.0 |
 
-  Expect live results to be lower again.
-- **It lags SPY in about a third of years.** The worst year was 2011 at −11%
-  vs SPY. 2018 was −8.5%.
-- **It boosts about 11% of days**, roughly 8 times a year at 3–4 days each.
-  That's about 32 fills a year.
-- **Taxes:** every rotation sells SPY and realizes the gain. In a taxable
-  account that drag could wipe out the edge. It's best run in an IRA or other
-  tax-advantaged account.
+  Expect live results to be lower.
+- **The two boosts mostly fire together.** SPY boosts about 10% of days and
+  QQQ about 11%; on 7% of days both are boosted and the whole account is at
+  2x.
+- **It lags in about a third of years.** It beat the 50/50 mix held in 67% of
+  years and SPY in 63%. The worst years vs SPY were 2022 (−10.3%), 2011
+  (−9.4%) and 2000 (−9.4%).
+- **About 62 fills a year**, counting both sleeves and rebalances.
+- **Taxes:** every rotation sells the core and realizes the gain. In a
+  taxable account that drag could wipe out the edge. It's best run in an IRA
+  or other tax-advantaged account.
 
-`research/leverage_study.py` compares this against the other candidates
-tested: 2x/3x trend timing, and 2x held always. All five were fixed before
-any of them was run.
+`research/leverage_study.py` compares the original SPY version against 2x/3x
+trend timing and 2x held always.
 
 ## Running it
 
@@ -73,8 +95,8 @@ The bot runs as a k8s CronJob at 15:45 and 12:45 ET on weekdays. Each run:
 1. Checks the Alpaca clock and calendar. It only acts when it's within
    `RUN_WINDOW_MINUTES` (20) of the close and at least 2 minutes before it. That
    handles half days.
-2. Builds SPY history from Alpaca adjusted daily bars. Today's latest IEX
-   trade stands in for today's close.
+2. Builds SPY and QQQ history from Alpaca adjusted daily bars. Today's
+   latest IEX trade stands in for today's close.
 3. Submits whole-share **market** orders, sells first, which fill right
    away. It sizes off 99% of equity, leaving a 1% buffer. It doesn't use
    market-on-close orders: Alpaca paper fills them only partly at random
@@ -90,8 +112,8 @@ left unfilled and re-plans from the positions that actually filled.
 
 **Requirements:**
 - **A dedicated Alpaca account.** The bot refuses to trade if it sees
-  positions other than SPY or SSO.
-- **A margin account.** The SPY sale and SSO purchase go in back to back,
+  positions other than SPY, SSO, QQQ or QLD.
+- **A margin account.** A rotation's sale and purchase go in back to back,
   so the buy is submitted before the sale's cash settles.
   Paper accounts are margin by default. The bot refuses to run on a cash
   account.

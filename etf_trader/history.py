@@ -6,10 +6,11 @@ Yahoo goes back to each ETF's inception. Alpaca's free history starts in
 returns are total returns. Results are cached to CSV so reruns are
 reproducible and work offline.
 
-SSO only exists from June 2006. For longer history, synthetic_2x() builds a
-2x S&P series from SPY: each day it earns 2x SPY's return, minus financing
-on the borrowed 1x and the expense ratio. The financing spread is set so
-the simulation matches real SSO since 2006 (run_backtest prints the check).
+SSO and QLD only exist from June 2006. For longer history, synthetic_2x()
+builds a 2x series from the index ETF: each day it earns 2x the index's
+return, minus financing on the borrowed 1x and the expense ratio. The
+financing spread is set so the simulation matches real SSO and QLD since
+2006 (run_backtest prints the check).
 """
 
 from pathlib import Path
@@ -19,11 +20,11 @@ import pandas as pd
 from . import strategy
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / "data"
-SYMBOLS = [strategy.CORE_SYMBOL, strategy.BOOST_SYMBOL, "^IRX"]
+SYMBOLS = [*strategy.universe(), "^IRX"]
 
-SSO_EXPENSE_RATIO = 0.0089
+EXPENSE_RATIOS = {"SSO": 0.0089, "QLD": 0.0095}
 # Swap financing costs more than the T-bill rate. Without this spread the
-# simulation overstates real SSO by ~0.8%/yr.
+# simulation overstates real SSO and QLD by ~0.8%/yr.
 FINANCING_SPREAD = 0.008
 
 
@@ -36,7 +37,10 @@ def load(refresh: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
     closes_path = CACHE_DIR / "closes.csv"
     if not refresh and opens_path.exists() and closes_path.exists():
         read = lambda p: pd.read_csv(p, index_col=0, parse_dates=True)
-        return read(opens_path), read(closes_path)
+        opens, closes = read(opens_path), read(closes_path)
+        if set(SYMBOLS) <= set(closes.columns):
+            return opens, closes
+        # Cache predates a universe change: fall through and re-download
 
     import yfinance as yf
 
@@ -54,7 +58,7 @@ def load(refresh: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
     return opens, closes
 
 
-def synthetic_2x(spy: pd.Series, tbill_pct: pd.Series) -> pd.Series:
-    rate = (tbill_pct.reindex(spy.index).ffill().fillna(0) / 100 + FINANCING_SPREAD) / 252
-    daily = 2 * spy.pct_change() - rate - SSO_EXPENSE_RATIO / 252
+def synthetic_2x(index: pd.Series, tbill_pct: pd.Series, expense_ratio: float) -> pd.Series:
+    rate = (tbill_pct.reindex(index.index).ffill().fillna(0) / 100 + FINANCING_SPREAD) / 252
+    daily = 2 * index.pct_change() - rate - expense_ratio / 252
     return (1 + daily.fillna(0)).cumprod() * 100

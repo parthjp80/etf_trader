@@ -16,13 +16,15 @@ routing. Filling 15 minutes early, at about the price the signal was
 computed from, costs little: the backtest's one-day-late variant loses
 ~1.2%/yr, and 15 minutes is a small fraction of that.
 
-A rotation sells SPY and buys SSO (or back) back to back, so the buy goes in
-before the sell's proceeds settle. That needs a margin account (Alpaca paper
+A rotation sells one leg of a sleeve and buys the other (SPY→SSO, QQQ→QLD,
+or back) back to back, so the buy goes in before the sell's proceeds
+settle. That needs a margin account (Alpaca paper
 accounts are margin by default); the bot refuses to run on a cash account.
 
 The strategy is a pure function of price history, so there's no state file:
 a missed day is reconciled on the next run (anything held with a zero
-target is sold, anything targeted but not held is bought).
+target is sold, anything targeted but not held is bought, anything more
+than REBALANCE_TOLERANCE off its target size is re-sized).
 
 The bot assumes it owns the whole account. It refuses to trade if it finds
 positions outside its universe, so it can't fight another bot.
@@ -52,11 +54,6 @@ CLOSE_BUFFER_MINUTES = 2
 # Size off slightly less than full equity: the close can differ from the
 # price we size at ~30 min earlier
 CASH_BUFFER = 0.01
-# Re-size a held position whose share count is this far off target. Holding
-# one ETF, drift only comes from the cash buffer and dividends, so 10% is
-# never hit by drift; a partial fill (Alpaca filled 608 of 1,113 SSO on
-# 2026-10-16) is.
-REBALANCE_TOLERANCE = 0.10
 
 log = logging.getLogger("etf_trader")
 
@@ -147,12 +144,12 @@ def plan_orders(
     """
     Return [(symbol, side, qty)], sells first.
 
-    Mirrors backtest.run(): a symbol is re-sized only when its target weight
-    changed. On top of that, positions that disagree with the target in kind
-    (held but targeted at 0, or targeted but not held) are always fixed —
-    that's how a missed run self-heals. So is a position more than
-    REBALANCE_TOLERANCE off its target size, which catches a partially
-    filled order without trading on everyday drift.
+    Mirrors backtest.run(): a symbol is re-sized when its target weight
+    changed, or when it is more than strategy.REBALANCE_TOLERANCE off its
+    target size (sleeve drift, or a partially filled order). On top of that,
+    positions that disagree with the target in kind (held but targeted at
+    0, or targeted but not held) are always fixed — that's how a missed run
+    self-heals.
     """
     orders = []
     for sym in strategy.universe():
@@ -164,7 +161,7 @@ def plan_orders(
             target_w != w_yesterday.get(sym, 0.0)
             or (target_w == 0 and held != 0)
             or (target_w > 0 and held == 0)
-            or abs(target_qty - held) > REBALANCE_TOLERANCE * target_qty
+            or abs(target_qty - held) > strategy.REBALANCE_TOLERANCE * target_qty
         )
         delta = target_qty - held
         if should_trade and delta:
@@ -189,24 +186,23 @@ def run(cfg: Config, now: datetime | None = None) -> dict:
     if not (CLOSE_BUFFER_MINUTES < minutes_left <= cfg.window_minutes):
         return {**record, "action": "skip", "reason": f"{minutes_left:.0f} min to close, outside window"}
 
-    symbols = strategy.universe()
-    core = strategy.CORE_SYMBOL
+    symbols, cores = strategy.universe(), strategy.cores()
     # ~400 trading days: SMA(200) warm-up plus plenty of room for the dip
     # rule's state to settle
-    closes = api.daily_closes([core], today - timedelta(days=600), today - timedelta(days=1))
-    spy = closes.loc[closes.index.date < today, core].dropna()
-    if len(spy) < strategy.REGIME_SMA_DAYS + 50:
-        raise RuntimeError(f"only {len(spy)} days of {core} history")
+    closes = api.daily_closes(cores, today - timedelta(days=600), today - timedelta(days=1))
+    closes = closes.loc[closes.index.date < today].reindex(columns=cores).dropna()
+    if len(closes) < strategy.REGIME_SMA_DAYS + 50:
+        raise RuntimeError(f"only {len(closes)} days of {'/'.join(cores)} history")
     prices = api.latest_prices(symbols)
-    spy.loc[pd.Timestamp(today)] = prices[core]
+    closes.loc[pd.Timestamp(today)] = [prices[c] for c in cores]
 
-    weights = strategy.target_weights(spy)
+    weights = strategy.target_weights(closes)
     w_today = weights.iloc[-1].to_dict()
     w_yesterday = weights.iloc[-2].to_dict()
 
     account = api.get("/v2/account")
     if int(account.get("multiplier", "1")) < 2:
-        raise RuntimeError("cash account: same-close rotations need a margin account")
+        raise RuntimeError("cash account: back-to-back rotations need a margin account")
     equity = float(account["equity"])
     positions = {p["symbol"]: int(float(p["qty"])) for p in api.get("/v2/positions")}
     foreign = sorted(set(positions) - set(symbols))
@@ -233,8 +229,11 @@ def run(cfg: Config, now: datetime | None = None) -> dict:
         **record,
         "action": "trade" if submitted else "hold",
         "equity": equity,
-        "spy_rsi2": round(float(strategy.rsi(spy).iloc[-1]), 1),
-        "boosted": bool(w_today[strategy.BOOST_SYMBOL]),
+        "sleeves": {
+            s.core: {"rsi2": round(float(strategy.rsi(closes[s.core]).iloc[-1]), 1),
+                     "boosted": bool(w_today[s.boost])}
+            for s in strategy.SLEEVES
+        },
         "targets": {k: v for k, v in w_today.items() if v},
         "positions": positions,
         "cancelled_open_orders": len(open_orders),

@@ -7,7 +7,8 @@ End-of-day P&L email, run by its own CronJob after the close.
 Reads the account, positions and today's orders from Alpaca, and the bot's
 own run log (runs.jsonl) for today's decision and the starting equity. The
 since-start return is compared against SPY held over the same span, which
-is the benchmark the strategy has to beat.
+and against the same 50/50 SPY/QQQ mix held without boosts: the
+benchmarks the strategy has to beat.
 
 Email settings come from the environment, same as lowfloat_trader:
 EMAIL_FROM, EMAIL_TO, EMAIL_PASSWORD (Gmail app password),
@@ -27,7 +28,6 @@ from pathlib import Path
 from . import live, strategy
 
 ET = live.ET
-CORE, BOOST = strategy.CORE_SYMBOL, strategy.BOOST_SYMBOL
 GREEN, RED, AMBER = "#3B6D11", "#A32D2D", "#8A6D1F"
 # Free data plan: SIP bars from the last 15 minutes are off limits
 SIP_DELAY = timedelta(minutes=16)
@@ -55,37 +55,44 @@ def gather(api, runs: list[dict], now: datetime) -> dict:
                      after=datetime.combine(today, time(), ET).isoformat(),
                      symbols=",".join(strategy.universe()))
 
-    spy = api.daily_closes([CORE], today - timedelta(days=600),
-                          (now - SIP_DELAY).replace(microsecond=0))[CORE].dropna()
+    cores = strategy.cores()
+    closes = api.daily_closes(cores, today - timedelta(days=600),
+                              (now - SIP_DELAY).replace(microsecond=0)).reindex(columns=cores).dropna()
     equity = float(account["equity"])
     last_equity = float(account.get("last_equity") or equity)
 
-    # The strategy's state after today's close, and what flips it tomorrow
-    boosted = bool(strategy.dip_position(spy).iloc[-1])
-    signal = {
-        "boosted": boosted,
-        "spy_close": float(spy.iloc[-1]),
-        "spy_close_date": spy.index[-1].date(),
-        "rsi2": float(strategy.rsi(spy).iloc[-1]),
-        "sma200": float(spy.rolling(strategy.REGIME_SMA_DAYS).mean().iloc[-1]),
-        # Tomorrow's close beats tomorrow's SMA(5) iff it beats the mean of
-        # the last 4 closes: c > (sum4 + c) / 5  ⇔  c > sum4 / 4
-        "exit_level": float(spy.iloc[-(strategy.EXIT_SMA_DAYS - 1):].mean()),
-    }
+    # Each sleeve's state after today's close, and what flips it tomorrow
+    signals = []
+    for sl in strategy.SLEEVES:
+        c = closes[sl.core]
+        signals.append({
+            "core": sl.core,
+            "boost": sl.boost,
+            "boosted": bool(strategy.dip_position(c).iloc[-1]),
+            "close": float(c.iloc[-1]),
+            "close_date": c.index[-1].date(),
+            "rsi2": float(strategy.rsi(c).iloc[-1]),
+            "sma200": float(c.rolling(strategy.REGIME_SMA_DAYS).mean().iloc[-1]),
+            # Tomorrow's close beats tomorrow's SMA(5) iff it beats the mean
+            # of the last 4 closes: c > (sum4 + c) / 5  ⇔  c > sum4 / 4
+            "exit_level": float(c.iloc[-(strategy.EXIT_SMA_DAYS - 1):].mean()),
+        })
 
-    # Since start: from the first run that traded, against SPY bought at
-    # that same close
+    # Since start: from the first run that traded, against SPY and against
+    # 50/50 SPY/QQQ bought at that same close
     since = None
     first = next((r for r in runs if r.get("action") == "trade"), None)
     if first:
         start = datetime.fromisoformat(first["ts"]).date()
-        spy_start = spy.loc[spy.index.date >= start]
-        if len(spy_start):
+        from_start = closes.loc[closes.index.date >= start]
+        if len(from_start):
+            rets = closes.iloc[-1] / from_start.iloc[0] - 1
             since = {
                 "date": start,
                 "equity": float(first["equity"]),
                 "bot": equity / float(first["equity"]) - 1,
-                "spy": float(spy.iloc[-1] / spy_start.iloc[0] - 1),
+                "spy": float(rets["SPY"]),
+                "mix": float(sum(sl.weight * rets[sl.core] for sl in strategy.SLEEVES)),
             }
 
     todays_runs = [r for r in runs if str(r.get("ts", ""))[:10] == today.isoformat()]
@@ -110,7 +117,7 @@ def gather(api, runs: list[dict], now: datetime) -> dict:
         "cash": float(account.get("cash", 0)),
         "positions": positions,
         "orders": orders,
-        "signal": signal,
+        "signals": signals,
         "since": since,
         "decision": decision,
         "warnings": warnings,
@@ -126,21 +133,26 @@ def _color(x):
 
 
 def render(d: dict, paper: bool = True) -> tuple[str, str]:
-    now, sig, since = d["now"], d["signal"], d["since"]
+    now, sigs, since = d["now"], d["signals"], d["since"]
     today_str = now.strftime("%A, %B %d %Y")
     arrow = "▲" if d["day_pnl"] >= 0 else "▼"
     td = 'style="padding:8px 10px;color:#555"'
     th = 'style="padding:8px 10px;text-align:left;color:#888;font-weight:500"'
 
-    mode = f"BOOST · 100% {BOOST}" if sig["boosted"] else f"CORE · 100% {CORE}"
-    if sig["boosted"]:
-        next_step = (f"Stays in {BOOST} until {CORE} closes above <b>${sig['exit_level']:,.2f}</b> "
-                     f"(its 5-day average), then rotates back to {CORE} at that close.")
-    else:
-        regime = "above" if sig["spy_close"] > sig["sma200"] else "below"
-        next_step = (f"Holds {CORE}. Boosts into {BOOST} when RSI(2) closes under "
-                     f"{strategy.RSI_ENTRY:g} while {CORE} is above its 200-day average "
-                     f"(${sig['sma200']:,.2f}; now {regime}).")
+    boosted = [g["boost"] for g in sigs if g["boosted"]]
+    mode = " + ".join(f"{g['core']} {'→ ' + g['boost'] + ' (boosted)' if g['boosted'] else 'core'}" for g in sigs)
+
+    def sleeve_line(g):
+        head = f"<b>{g['core']}</b> closed ${g['close']:,.2f} ({g['close_date']:%b %d}), RSI(2) {g['rsi2']:.1f}. "
+        if g["boosted"]:
+            return head + (f"Holding {g['boost']} until {g['core']} closes above <b>${g['exit_level']:,.2f}</b> "
+                           f"(its 5-day average), then back to {g['core']} at that close.")
+        regime = "above" if g["close"] > g["sma200"] else "below, so no boost possible"
+        return head + (f"Holding {g['core']}. Boosts into {g['boost']} when RSI(2) closes under "
+                       f"{strategy.RSI_ENTRY:g} while above its 200-day average "
+                       f"(${g['sma200']:,.2f}; now {regime}).")
+
+    sleeve_lines = "<br>".join(sleeve_line(g) for g in sigs)
 
     if d["decision"] and d["decision"].get("orders"):
         placed = ", ".join(f"{o['side']} {o['qty']} {o['symbol']}" for o in d["decision"]["orders"])
@@ -157,9 +169,9 @@ def render(d: dict, paper: bool = True) -> tuple[str, str]:
     if since:
         cards += [
             (f"{since['bot']:+.2%}", f"Bot since {since['date']:%b %d}", _color(since["bot"])),
-            (f"{since['spy']:+.2%}", f"{CORE} same span", _color(since["spy"])),
+            (f"{since['mix']:+.2%}", "50/50 held, same span", _color(since["mix"])),
+            (f"{since['spy']:+.2%}", "SPY, same span", _color(since["spy"])),
         ]
-    cards.append((f"{sig['rsi2']:.1f}", f"{CORE} RSI(2)", "#185FA5"))
     card_html = "".join(f'''
     <td style="padding:16px 10px;border-right:1px solid #EBEBEB;text-align:center">
       <div style="font-size:22px;font-weight:700;color:{c}">{v}</div>
@@ -228,8 +240,8 @@ def render(d: dict, paper: bool = True) -> tuple[str, str]:
 
   <div style="padding:18px 24px;border-bottom:1px solid #EBEBEB;font-size:13px;color:#333;line-height:1.6">
     <div style="font-size:14px;font-weight:600;margin-bottom:6px">Signal: {mode}</div>
-    {CORE} closed at ${sig['spy_close']:,.2f} ({sig['spy_close_date']:%b %d}). {decision}<br>
-    {next_step}
+    {sleeve_lines}<br>
+    {decision}
   </div>
 
   <div style="padding:18px 24px 6px">
@@ -259,7 +271,7 @@ def render(d: dict, paper: bool = True) -> tuple[str, str]:
 </body></html>"""
 
     subject = (f"📊 ETF Trader — {now:%a %b %d} | {arrow} ${abs(d['day_pnl']):,.2f} "
-               f"({d['day_pct']:+.2%}) | {'SSO boost' if sig['boosted'] else 'SPY'}")
+               f"({d['day_pct']:+.2%}) | {' + '.join(boosted) + ' boost' if boosted else 'no boost'}")
     if d["warnings"]:
         subject += " | ⚠️"
     return subject, html

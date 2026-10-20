@@ -139,7 +139,7 @@ def main():
     q = raw["QQQ"].dropna()
     syn = pd.DataFrame({
         "SPY": raw["SPY"].loc[q.index], "QQQ": q,
-        "SSO": history.synthetic_2x(raw["SPY"], raw["^IRX"]).loc[q.index],
+        "SSO": history.synthetic_2x(raw["SPY"], raw["^IRX"], history.EXPENSE_RATIOS["SSO"]).loc[q.index],
         "QLD": syn_qld,
     })
     start = syn.index[strategy.REGIME_SMA_DAYS]

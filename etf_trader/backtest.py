@@ -4,7 +4,9 @@ Daily backtest for strategy.target_weights().
 Execution model mirrors live.py:
   * Signals are computed from the close of day t.
   * A symbol is traded on day t only if its target weight changed from
-    day t-1. Between changes, holdings drift with the market.
+    day t-1, or its holding has drifted more than rebalance_tolerance off
+    target (strategy.REBALANCE_TOLERANCE, as live). Otherwise holdings
+    drift with the market.
   * fill="close"     — filled at day t's close (live fills ~15 min before it).
   * fill="next_open" — filled at day t+1's open. A pessimistic cross-check:
     if the edge only exists at the exact close, it isn't robust.
@@ -34,6 +36,7 @@ def run(
     cost_bps: float = 5.0,
     fill: str = "close",
     start_equity: float = 100_000.0,
+    rebalance_tolerance: float | None = strategy.REBALANCE_TOLERANCE,
 ) -> Result:
     if fill not in ("close", "next_open"):
         raise ValueError(fill)
@@ -68,11 +71,13 @@ def run(
         equity[t] = value
 
         prev = w[t - 1] if t else np.zeros(len(symbols))
+        target = w[t] * value / px
         changed = w[t] != prev
+        if rebalance_tolerance is not None:
+            changed |= (shares != 0) & (np.abs(target - shares) > rebalance_tolerance * target)
         if not changed.any() or (fill == "next_open" and t == len(dates) - 1):
             continue
 
-        target = w[t] * value / px
         delta = np.where(changed, target - shares, 0.0)
         delta[np.abs(delta) < 1e-9] = 0.0
         if not delta.any():
@@ -106,25 +111,25 @@ def metrics(equity: pd.Series) -> dict:
     }
 
 
-def boost_trades(closes: pd.DataFrame, cost_bps: float = 5.0) -> pd.DataFrame:
+def boost_trades(core: pd.Series, lev: pd.Series, cost_bps: float = 5.0) -> pd.DataFrame:
     """
-    One row per boost window: what the extra 1x of exposure earned.
+    One row per boost window of one sleeve: what the extra 1x earned.
 
-    The boost's payoff is the SSO return minus the SPY return it replaced.
-    Each window costs two round trips (SPY→SSO, SSO→SPY), i.e. four fills.
+    The boost's payoff is the 2x ETF's return minus the return of the core
+    it replaced. Each window costs two round trips (core→2x, 2x→core), i.e.
+    four fills.
     """
-    spy, sso = closes[strategy.CORE_SYMBOL], closes[strategy.BOOST_SYMBOL]
-    pos = strategy.dip_position(spy).astype(int)
+    pos = strategy.dip_position(core).astype(int)
     flips = pos.diff().fillna(pos)
-    entries, exits = spy.index[flips == 1], spy.index[flips == -1]
+    entries, exits = core.index[flips == 1], core.index[flips == -1]
     rows = []
     for entry in entries:
         later = exits[exits > entry]
         if not len(later):
             break  # still open
         exit_ = later[0]
-        spy_ret = spy[exit_] / spy[entry] - 1
-        sso_ret = sso[exit_] / sso[entry] - 1
-        rows.append((entry, exit_, len(spy.loc[entry:exit_]) - 1, spy_ret,
-                     sso_ret - spy_ret - 4 * cost_bps / 1e4))
-    return pd.DataFrame(rows, columns=["entry", "exit", "days", "spy_ret", "edge"])
+        core_ret = core[exit_] / core[entry] - 1
+        lev_ret = lev[exit_] / lev[entry] - 1
+        rows.append((entry, exit_, len(core.loc[entry:exit_]) - 1, core_ret,
+                     lev_ret - core_ret - 4 * cost_bps / 1e4))
+    return pd.DataFrame(rows, columns=["entry", "exit", "days", "core_ret", "edge"])
