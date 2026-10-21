@@ -156,7 +156,7 @@ def render(d: dict, paper: bool = True) -> tuple[str, str]:
 
     if d["decision"] and d["decision"].get("orders"):
         placed = ", ".join(f"{o['side']} {o['qty']} {o['symbol']}" for o in d["decision"]["orders"])
-        decision = f"Today's run: {placed} at the close."
+        decision = f"Today's run: {placed}."
     elif d["decision"]:
         decision = "Today's run: no change, holding."
     else:
