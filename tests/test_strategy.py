@@ -278,3 +278,159 @@ def test_submits_plain_market_day_orders(monkeypatch):
     monkeypatch.setattr(api, "_req", lambda method, url, **kw: sent.update(kw["json"]))
     api.submit("SSO", 497, "buy", "etf-x")
     assert sent["type"] == "market" and sent["time_in_force"] == "day"
+
+
+# ── AI review ──
+
+import json  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+from etf_trader import ai_review  # noqa: E402
+
+
+def dip_today(n=500):
+    """Cores in a steady uptrend whose last close drops 3%: both rules fire today."""
+    idx = pd.bdate_range("2020-01-01", periods=n)
+    up = pd.Series(100 * 1.001 ** np.arange(n), index=idx)
+    cores = pd.DataFrame({"SPY": up, "QQQ": up * 3})
+    cores.iloc[-1] = cores.iloc[-2] * 0.97
+    return cores
+
+
+class FakeClaude:
+    def __init__(self, reviews=None, error=None):
+        self.reviews, self.error, self.calls = reviews, error, []
+        self.beta = SimpleNamespace(messages=SimpleNamespace(create=self.create))
+
+    def create(self, **kw):
+        self.calls.append(kw)
+        if self.error:
+            raise self.error
+        text = json.dumps({"reviews": self.reviews, "note": "n"})
+        return SimpleNamespace(stop_reason="end_turn", content=[SimpleNamespace(type="text", text=text)],
+                               usage=SimpleNamespace(input_tokens=1, output_tokens=1))
+
+
+def _reviewer(tmp_path, client, mode="enforce", fail_mode="closed"):
+    cfg = ai_review.ReviewConfig(mode=mode, fail_mode=fail_mode)
+    return ai_review.Reviewer(cfg, tmp_path / "ai_reviews.jsonl", news_fn=lambda n: [], client=client)
+
+
+def test_window_starts_marks_each_boost_window():
+    cores = dip_today()
+    on = strategy.dip_position(cores["SPY"])
+    assert on.iloc[-1] and not on.iloc[-2]
+    starts = ai_review.window_starts(cores["SPY"])
+    assert starts.iloc[-1] == cores.index[-1]
+    assert starts[~on].isna().all()
+
+
+def test_review_asks_once_per_window_and_apply_holds_for_the_window(tmp_path):
+    cores = dip_today()
+    today = cores.index[-1]
+    assert ai_review.window_starts(cores["SPY"]).iloc[-1] == today
+    claude = FakeClaude([
+        {"core": "SPY", "action": "veto", "size_multiplier": 0, "reason": "FOMC tomorrow", "risk_flags": ["macro_event"]},
+        {"core": "QQQ", "action": "reduce", "size_multiplier": 0.9, "reason": "r", "risk_flags": ["bogus"]},
+    ])
+    rv = _reviewer(tmp_path, claude)
+    decisions, made = rv.review(cores, {"equity": 1})
+    assert len(claude.calls) == 1 and len(made) == 2
+    assert claude.calls[0]["output_config"]["format"]["type"] == "json_schema"
+    spy, qqq = decisions[("SPY", today.date().isoformat())], decisions[("QQQ", today.date().isoformat())]
+    assert spy.action == "veto" and spy.size_multiplier == 0 and spy.risk_flags == ["macro_event"]
+    assert qqq.size_multiplier == ai_review.MAX_REDUCE and qqq.risk_flags == []
+
+    # Same day again (a retry): reuses the logged decisions, no new call
+    assert rv.review(cores, {})[1] == [] and len(claude.calls) == 1
+
+    # Next day, still in the window: the veto still applies, and yesterday's
+    # weights agree, so plan_orders sees nothing to change
+    nxt = pd.concat([cores, pd.DataFrame([cores.iloc[-1] * 0.99], index=[today + pd.offsets.BDay()])])
+    assert strategy.dip_position(nxt["SPY"]).iloc[-1]
+    decisions, made = rv.review(nxt, {})
+    assert made == []
+    w = ai_review.apply(strategy.target_weights(nxt), nxt, decisions)
+    assert w["SSO"].iloc[-1] == 0 and w["SPY"].iloc[-1] == 0.5
+    assert w["SSO"].iloc[-2] == 0 and w["SPY"].iloc[-2] == 0.5
+    assert w["QLD"].iloc[-1] == pytest.approx(0.5 * 0.75) and w["QQQ"].iloc[-1] == pytest.approx(0.5 * 0.25)
+
+
+def test_review_failure_modes(tmp_path):
+    cores = dip_today()
+    boom = FakeClaude(error=RuntimeError("down"))
+    _, made = _reviewer(tmp_path / "a", boom, "enforce", "closed").review(cores, {})
+    assert {d.action for d in made} == {"veto"} and {d.source for d in made} == {"fail_closed"}
+    _, made = _reviewer(tmp_path / "b", boom, "enforce", "open").review(cores, {})
+    assert {d.action for d in made} == {"approve"}
+    _, made = _reviewer(tmp_path / "c", boom, "shadow", "closed").review(cores, {})
+    assert {d.action for d in made} == {"approve"} and {d.source for d in made} == {"fail_open"}
+    # Claude leaving a sleeve out counts as a failure for that sleeve
+    partial = FakeClaude([{"core": "SPY", "action": "approve", "size_multiplier": 1, "reason": "", "risk_flags": []}])
+    decisions, _ = _reviewer(tmp_path / "d", partial).review(cores, {})
+    assert {d.core: d.source for d in decisions.values()} == {"SPY": "claude", "QQQ": "fail_closed"}
+
+
+def test_review_not_called_without_a_new_boost(tmp_path):
+    claude = FakeClaude([])
+    cores = make_cores(500)
+    cores.iloc[-1] = cores.iloc[-2] * 1.01
+    assert _reviewer(tmp_path, claude).review(cores, {}) == ({}, [])
+    assert claude.calls == []
+
+
+def test_review_config_validates():
+    assert ai_review.ReviewConfig.from_env({}).mode == "off"
+    with pytest.raises(SystemExit):
+        ai_review.ReviewConfig.from_env({"AI_REVIEW": "yes"})
+    with pytest.raises(SystemExit):
+        ai_review.ReviewConfig.from_env({"AI_REVIEW_FAIL_MODE": "maybe"})
+
+
+def test_run_enforced_veto_keeps_core(monkeypatch, tmp_path):
+    cores = dip_today()
+    claude = FakeClaude([
+        {"core": "SPY", "action": "veto", "size_multiplier": 0, "reason": "x", "risk_flags": []},
+        {"core": "QQQ", "action": "approve", "size_multiplier": 1, "reason": "y", "risk_flags": []},
+    ])
+    real = ai_review.Reviewer.__init__
+    monkeypatch.setattr(ai_review.Reviewer, "__init__",
+                        lambda self, *a, **kw: real(self, *a, **{**kw, "client": claude}))
+    fake = FakeAlpaca(cores, positions={"SPY": 100, "QQQ": 50})
+    fake.news = lambda limit: []
+    monkeypatch.setattr(live, "Alpaca", fake)
+    env = {"APCA_KEY_ID": "k", "APCA_SECRET_KEY": "s", "AI_REVIEW": "enforce", "LOG_PATH": str(tmp_path)}
+    now = (cores.index[-1] + pd.Timedelta(hours=15, minutes=45)).tz_localize(live.ET).to_pydatetime()
+    rec = live.run(live.Config(env), now=now)
+    assert rec["ai_review"]["SPY"]["action"] == "veto"
+    syms = {s for s, _, _ in fake.submitted}
+    assert "SSO" not in syms and "QLD" in syms
+    assert ("QQQ", "sell", 50) in fake.submitted
+
+    # Shadow: logged, but both sleeves boost
+    fake2 = FakeAlpaca(cores, positions={"SPY": 100, "QQQ": 50})
+    fake2.news = lambda limit: []
+    monkeypatch.setattr(live, "Alpaca", fake2)
+    rec = live.run(live.Config({**env, "AI_REVIEW": "shadow", "LOG_PATH": str(tmp_path / "s")}), now=now)
+    assert {s for s, _, _ in fake2.submitted} >= {"SSO", "QLD"}
+
+
+def test_report_grades_finished_windows():
+    cores = dip_today(500)
+    # Rally after the dip so the window exits
+    later = pd.bdate_range(cores.index[-1] + pd.offsets.BDay(), periods=3)
+    tail = pd.DataFrame({"SPY": cores["SPY"].iloc[-1] * 1.02 ** np.arange(1, 4),
+                         "QQQ": cores["QQQ"].iloc[-1] * 1.02 ** np.arange(1, 4)}, index=later)
+    cl = pd.concat([cores, tail])
+    start = ai_review.window_starts(cl["SPY"]).dropna().iloc[-1]
+    lev = pd.DataFrame({"SSO": cl["SPY"] ** 2 / 100, "QLD": cl["QQQ"] ** 2 / 300}, index=cl.index)
+    edges = ai_review.window_edges(cl["SPY"], lev["SSO"])
+    assert edges[start.date().isoformat()]["edge"] > 0
+
+    class Api:
+        def daily_closes(self, symbols, start, end):
+            return lev
+    d = ai_review.Decision(core="SPY", window_start=start.date().isoformat(), action="veto",
+                           size_multiplier=0, reason="r", source="claude")
+    g = report.grade_reviews(Api(), cl, {("SPY", d.window_start): d}, cl.index[-1])
+    assert len(g["graded"]["veto"]) == 1 and g["open"] == {}

@@ -164,6 +164,63 @@ a ⚠️ in the subject. It uses the same Gmail credentials as lowfloat_trader
 kubectl -n trading create job etf-report-now --from=cronjob/etf-trader-report
 ```
 
+### AI review of boosts (Claude)
+
+This works like tradingbot's pre-trade review, scoped to the one decision
+this bot makes. On a day a sleeve's dip rule fires, the live run sends
+Claude one request (`etf_trader/ai_review.py`) with:
+
+- each index's RSI(2), its distance from the 200-day and 5-day averages,
+  and the last 10 daily returns
+- recent headlines tagged SPY/QQQ/SSO/QLD (Alpaca news, last 3 days)
+- the account's equity and positions
+
+Claude answers **APPROVE**, **REDUCE** (hold only 25–75% of the sleeve in
+the 2x ETF) or **VETO** (stay in SPY/QQQ), with a reason that cites a
+specific fact. What it can change is limited:
+
+| Claude can | Claude cannot |
+|---|---|
+| Skip a boost, or boost only part of a sleeve | Start a boost the rule didn't fire |
+| | Add leverage, delay the exit, or touch the core sleeves |
+
+The prompt tells Claude that fearful headlines come with every dip the
+rule buys, and that fear alone is not a reason to veto. It should veto
+only for something concrete: a scheduled FOMC/CPI/payrolls release in the
+next few sessions, a systemic shock, or broken prices.
+
+One decision covers the whole boost window, so a veto isn't undone the
+next day. Decisions go in `/app/logs/ai_reviews.jsonl`, keyed by sleeve and
+window start date. There's no call on days when no boost starts, which is
+roughly 20 days a year.
+
+| `AI_REVIEW` | Behavior |
+|---|---|
+| `off` | Not called. |
+| `shadow` (shipped) | Claude reviews and every decision is logged, but the bot trades as if it were off. |
+| `enforce` | Vetoes and reductions are applied. |
+
+`AI_REVIEW_FAIL_MODE` only matters in `enforce`. It decides what happens
+when the call fails: `closed` (the default) skips that boost, `open`
+boosts anyway. In `shadow`, a failed call always counts as approval.
+`AI_REVIEW_MODEL` defaults to `claude-opus-5-5`. If Claude declines a
+request on safety grounds, the API retries it on a fallback model
+(`fallbacks: "default"`).
+
+**Is it worth it?** The end-of-day email shows Claude's call on any open
+window, plus a running grade: for finished windows, the average edge of
+the 2x over the 1x, split by what Claude said. Prices give that edge
+whether or not the veto was applied, so shadow mode grades itself. Wait
+for 20 or more vetoed windows before reading anything into it. At about
+20 boost windows a year that takes years, and the backtested edge per
+window (+0.29%) is small enough that a reviewer which vetoes often
+will most likely cost money. Switch to `enforce` only if the vetoed
+windows clearly did worse.
+
+To turn it on, add `ANTHROPIC_API_KEY` with `sops k8s/secret.env`. Until
+then every review fails open and is logged as `fail_open`. The prompt is
+`SYSTEM_PROMPT` in `etf_trader/ai_review.py`.
+
 Everyday operations:
 
 ```bash

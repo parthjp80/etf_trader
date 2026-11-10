@@ -6,9 +6,13 @@ End-of-day P&L email, run by its own CronJob after the close.
 
 Reads the account, positions and today's orders from Alpaca, and the bot's
 own run log (runs.jsonl) for today's decision and the starting equity. The
-since-start return is compared against SPY held over the same span, which
-and against the same 50/50 SPY/QQQ mix held without boosts: the
-benchmarks the strategy has to beat.
+since-start return is compared against SPY held over the same span, and
+against the same 50/50 SPY/QQQ mix held without boosts: the benchmarks
+the strategy has to beat.
+
+With the AI reviewer on, it also shows Claude's call on any open boost
+window and grades the reviewer: the 2x-minus-1x edge of every finished
+window it approved, reduced or vetoed (ai_reviews.jsonl).
 
 Email settings come from the environment, same as lowfloat_trader:
 EMAIL_FROM, EMAIL_TO, EMAIL_PASSWORD (Gmail app password),
@@ -25,7 +29,9 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 
-from . import live, strategy
+import pandas as pd
+
+from . import ai_review, live, strategy
 
 ET = live.ET
 GREEN, RED, AMBER = "#3B6D11", "#A32D2D", "#8A6D1F"
@@ -47,7 +53,7 @@ def load_runs(path: Path) -> list[dict]:
     return runs
 
 
-def gather(api, runs: list[dict], now: datetime) -> dict:
+def gather(api, runs: list[dict], now: datetime, reviews: dict | None = None) -> dict:
     today = now.date()
     account = api.get("/v2/account")
     positions = api.get("/v2/positions")
@@ -77,6 +83,11 @@ def gather(api, runs: list[dict], now: datetime) -> dict:
             # of the last 4 closes: c > (sum4 + c) / 5  ⇔  c > sum4 / 4
             "exit_level": float(c.iloc[-(strategy.EXIT_SMA_DAYS - 1):].mean()),
         })
+
+    review = grade_reviews(api, closes, reviews or {}, today) if reviews else None
+    if review:
+        for g in signals:
+            g["review"] = review["open"].get(g["core"])
 
     # Since start: from the first run that traded, against SPY and against
     # 50/50 SPY/QQQ bought at that same close
@@ -121,7 +132,30 @@ def gather(api, runs: list[dict], now: datetime) -> dict:
         "since": since,
         "decision": decision,
         "warnings": warnings,
+        "review": review,
     }
+
+
+def grade_reviews(api, closes, decisions: dict, today) -> dict:
+    """
+    Claude's decision on each sleeve's open window, and, per action, the
+    average edge of finished windows. Fallback decisions (API down) aren't
+    Claude's call and are left out of the grade.
+    """
+    boosts = [s.boost for s in strategy.SLEEVES]
+    lev = api.daily_closes(boosts, closes.index[0].date(), closes.index[-1].date())
+    lev = lev.reindex(index=closes.index, columns=boosts)
+    graded = {a: [] for a in ai_review.ACTIONS}
+    open_ = {}
+    for s in strategy.SLEEVES:
+        start = ai_review.window_starts(closes[s.core]).iloc[-1]
+        if pd.notna(start):
+            open_[s.core] = decisions.get((s.core, start.date().isoformat()))
+        edges = ai_review.window_edges(closes[s.core], lev[s.boost])
+        for (core, start_iso), d in decisions.items():
+            if core == s.core and d.source == "claude" and start_iso in edges:
+                graded[d.action].append(edges[start_iso]["edge"])
+    return {"open": {k: v for k, v in open_.items() if v}, "graded": graded}
 
 
 def _money(x, sign=True):
@@ -152,7 +186,32 @@ def render(d: dict, paper: bool = True) -> tuple[str, str]:
                        f"{strategy.RSI_ENTRY:g} while above its 200-day average "
                        f"(${g['sma200']:,.2f}; now {regime}).")
 
-    sleeve_lines = "<br>".join(sleeve_line(g) for g in sigs)
+    def review_line(g):
+        r = g.get("review")
+        if not r:
+            return ""
+        how = {"approve": "approved the boost", "veto": "vetoed the boost",
+               "reduce": f"cut the boost to {r.size_multiplier:.0%} of the sleeve"}[r.action]
+        applied = "" if r.mode == "enforce" else " (shadow: not applied)"
+        return (f"<br><span style=\"color:#666\">AI review: Claude {how}{applied}. "
+                f"{r.reason}</span>")
+
+    sleeve_lines = "<br>".join(sleeve_line(g) + review_line(g) for g in sigs)
+
+    review_html = ""
+    if d.get("review"):
+        parts = []
+        for action, edges in d["review"]["graded"].items():
+            if edges:
+                parts.append(f"{action} {len(edges)} (avg edge {sum(edges) / len(edges):+.2%})")
+        n_veto = len(d["review"]["graded"]["veto"])
+        summary = ", ".join(parts) if parts else "no finished windows yet"
+        review_html = f"""
+  <div style="padding:12px 24px;border-bottom:1px solid #EBEBEB;font-size:12px;color:#666;line-height:1.5">
+    <b>AI reviewer so far</b>, finished boost windows by Claude's call: {summary}.
+    Edge is the 2x ETF's return minus the 1x over the window, whether or not the call was applied.
+    {"Too few vetoes to judge yet (want 20+)." if n_veto < 20 else ""}
+  </div>"""
 
     if d["decision"] and d["decision"].get("orders"):
         placed = ", ".join(f"{o['side']} {o['qty']} {o['symbol']}" for o in d["decision"]["orders"])
@@ -243,6 +302,7 @@ def render(d: dict, paper: bool = True) -> tuple[str, str]:
     {sleeve_lines}<br>
     {decision}
   </div>
+{review_html}
 
   <div style="padding:18px 24px 6px">
     <div style="font-size:14px;font-weight:600;color:#333;margin-bottom:10px">Holdings at the close</div>
@@ -300,7 +360,9 @@ def main():
     if not any(c["date"] == today for c in api.get("/v2/calendar", start=today, end=today)):
         log.info("not a trading day, no report")
         return
-    data = gather(api, load_runs(cfg.log_path / "runs.jsonl"), now)
+    reviews = (ai_review.load_decisions(cfg.log_path / "ai_reviews.jsonl")
+               if cfg.ai_review.mode != "off" else None)
+    data = gather(api, load_runs(cfg.log_path / "runs.jsonl"), now, reviews)
     subject, html = render(data, paper=cfg.base_url == live.PAPER_URL)
     if "--stdout" in sys.argv:
         print(html)

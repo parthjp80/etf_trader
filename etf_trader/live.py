@@ -26,6 +26,9 @@ a missed day is reconciled on the next run (anything held with a zero
 target is sold, anything targeted but not held is bought, anything more
 than REBALANCE_TOLERANCE off its target size is re-sized).
 
+With AI_REVIEW=shadow or enforce, Claude gets a second look at each boost
+before it's placed (see ai_review.py). It can only shrink or skip a boost.
+
 The bot assumes it owns the whole account. It refuses to trade if it finds
 positions outside its universe, so it can't fight another bot.
 """
@@ -43,7 +46,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 
-from . import strategy
+from . import ai_review, strategy
 
 ET = ZoneInfo("America/New_York")
 PAPER_URL = "https://paper-api.alpaca.markets"
@@ -52,7 +55,7 @@ DATA_URL = "https://data.alpaca.markets"
 # Leave market orders a few minutes to fill before the close
 CLOSE_BUFFER_MINUTES = 2
 # Size off slightly less than full equity: the close can differ from the
-# price we size at ~30 min earlier
+# price we size at ~15 min earlier
 CASH_BUFFER = 0.01
 
 log = logging.getLogger("etf_trader")
@@ -67,6 +70,7 @@ class Config:
         self.dry_run = env.get("DRY_RUN", "false").lower() == "true"
         self.window_minutes = int(env.get("RUN_WINDOW_MINUTES", "20"))
         self.log_path = Path(env.get("LOG_PATH", "/app/logs"))
+        self.ai_review = ai_review.ReviewConfig.from_env(env)
         if self.base_url != PAPER_URL and not self.allow_live:
             raise SystemExit(f"Refusing to trade against {self.base_url} without ALLOW_LIVE=true")
 
@@ -122,6 +126,14 @@ class Alpaca:
         # which trade a penny wide.
         trades = self.data("/v2/stocks/trades/latest", symbols=",".join(symbols), feed="iex")["trades"]
         return {sym: float(t["p"]) for sym, t in trades.items()}
+
+    def news(self, limit: int = 40, days: int = 3) -> list[dict]:
+        """Recent headlines tagged with the strategy's ETFs, newest first."""
+        start = (datetime.now(ET) - timedelta(days=days)).replace(microsecond=0)
+        page = self.data("/v1beta1/news", symbols=",".join(strategy.universe()),
+                         start=start.isoformat(), limit=min(limit, 50), sort="desc")
+        return [{"time": n.get("created_at"), "headline": n.get("headline"), "source": n.get("source")}
+                for n in page.get("news") or []]
 
     def cancel_order(self, order_id):
         self._req("DELETE", f"{self.cfg.base_url}/v2/orders/{order_id}")
@@ -196,10 +208,6 @@ def run(cfg: Config, now: datetime | None = None) -> dict:
     prices = api.latest_prices(symbols)
     closes.loc[pd.Timestamp(today)] = [prices[c] for c in cores]
 
-    weights = strategy.target_weights(closes)
-    w_today = weights.iloc[-1].to_dict()
-    w_yesterday = weights.iloc[-2].to_dict()
-
     account = api.get("/v2/account")
     if int(account.get("multiplier", "1")) < 2:
         raise RuntimeError("cash account: back-to-back rotations need a margin account")
@@ -209,6 +217,27 @@ def run(cfg: Config, now: datetime | None = None) -> dict:
     if foreign:
         raise RuntimeError(f"account holds positions outside the strategy: {foreign} — "
                            "this bot needs a dedicated account")
+
+    weights = strategy.target_weights(closes)
+    reviews = {}
+    if cfg.ai_review.mode != "off":
+        reviewer = ai_review.Reviewer(cfg.ai_review, cfg.log_path / "ai_reviews.jsonl",
+                                      news_fn=api.news, now_fn=lambda: datetime.now(ET))
+        decisions, _ = reviewer.review(closes, {"equity": equity, "positions": positions})
+        if reviewer.enforcing:
+            # Only decisions made while enforcing: switching modes mid-window
+            # doesn't suddenly unwind a boost that a shadow veto never touched
+            weights = ai_review.apply(weights, closes, {
+                k: d for k, d in decisions.items() if d.mode == "enforce"})
+        for s in strategy.SLEEVES:
+            start = ai_review.window_starts(closes[s.core]).iloc[-1]
+            d = decisions.get((s.core, start.date().isoformat())) if pd.notna(start) else None
+            if d:
+                reviews[s.core] = {"action": d.action, "size_multiplier": d.size_multiplier,
+                                   "mode": d.mode, "source": d.source, "reason": d.reason,
+                                   "window_start": d.window_start}
+    w_today = weights.iloc[-1].to_dict()
+    w_yesterday = weights.iloc[-2].to_dict()
 
     # Idempotent re-runs: drop anything a previous attempt left unfilled.
     # Positions above already include what did fill.
@@ -234,6 +263,7 @@ def run(cfg: Config, now: datetime | None = None) -> dict:
                      "boosted": bool(w_today[s.boost])}
             for s in strategy.SLEEVES
         },
+        **({"ai_review": reviews} if reviews else {}),
         "targets": {k: v for k, v in w_today.items() if v},
         "positions": positions,
         "cancelled_open_orders": len(open_orders),
