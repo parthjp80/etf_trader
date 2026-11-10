@@ -19,6 +19,8 @@ secretGenerator:
   - name: etf-trader-secrets
     envs:
       - secret.env
+      # ANTHROPIC_API_KEY for the AI review, sops-encrypted on its own
+      - anthropic-secret.env
 
 labels:
   - pairs:

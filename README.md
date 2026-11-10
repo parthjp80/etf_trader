@@ -217,8 +217,10 @@ window (+0.29%) is small enough that a reviewer which vetoes often
 will most likely cost money. Switch to `enforce` only if the vetoed
 windows clearly did worse.
 
-To turn it on, add `ANTHROPIC_API_KEY` with `sops k8s/secret.env`. Until
-then every review fails open and is logged as `fail_open`. The prompt is
+The key is `ANTHROPIC_API_KEY` in `k8s/anthropic-secret.env`, which is
+sops-encrypted like `secret.env` and merged into the same k8s secret. Edit
+it with `sops k8s/anthropic-secret.env`. If the key is missing or wrong,
+every review fails open and is logged as `fail_open`. The prompt is
 `SYSTEM_PROMPT` in `etf_trader/ai_review.py`.
 
 Everyday operations:
